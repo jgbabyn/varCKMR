@@ -1,0 +1,4273 @@
+#+Title: varCKMR
+#+author: Jonathan Babyn
+#+LATEX_HEADER: \usepackage{bm}
+#+LATEX_HEADER: \usepackage[margin=1in]{geometry}
+#+LATEX_HEADER: \usepackage{amsmath}
+
+* Introduction
+  
+  ~varCKMR~ is a pseudo R package to showcase a method of estimating the variance in
+the distribution of number of offspring. It does this using within birth-cohort 
+sibling comparisons. 
+
+It contains an individual based simulation that installs as the ~R~ package ~varCKMR~ along with 
+some helper functions.
+The ~TMB~ models used in the analysis are in the ~models~ folder with the ~ssmodelAdj.cpp~
+being the model using within-cohort sibling comparisons and the ~ssmodelNoSC.cpp~ model 
+omitting them.
+
+The ~scripts~ folder contains the scripts to recreate the simulations used in the analysis. ~populations~
+is where the ~populations~ used in the analysis would be kept althought they are ommitted here for space reasons. 
+~sims~ contains all the samples from each population but are again ommitted for space reasons. 
+
+This org file contains all the files to make all the files in this folder.
+
+* C++ Code 
+
+** Shared parts
+
+These functions are shared among all the models.
+
+#+NAME: commonbegin
+#+begin_src C++ 
+  #include <TMB.hpp>
+  #include <Eigen/Eigenvalues>
+
+  template<class Type>
+  vector<Type>  get_ls(vector<Type> &Z){
+    vector<Type> surv = exp(-Z);
+    vector<Type> ls(Z.size());
+    ls(0) = 1;
+    for(int a = 1; a < surv.size();++a){
+      ls(a) = ls(a-1)*surv(a-1);
+    }
+    return ls;
+  }
+
+  template<class Type>
+  vector<Type> death_probs(vector<Type> &Z){
+    vector<Type> surv = exp(-Z);
+    vector<Type> dprobs(surv.size());
+    vector<Type> ells = get_ls(Z);
+    for(int a = 0; a < surv.size()-1; ++a){
+      dprobs(a) = ells(a)*(1-surv(a));
+    }
+    dprobs(surv.size()-1) = ells(surv.size()-1);
+    return dprobs;
+  }
+
+  template<class Type>
+  Type lifetime_reproductive_mean(vector<Type> &Z, vector<Type> &fec){
+    vector<Type> dprob = death_probs(Z);
+    vector<Type> fecS(fec.size());
+    fecS(0) = fec(0);
+    for(int a = 1; a < fec.size(); ++a){
+      fecS(a) = fec(a)+fecS(a-1);
+    }  
+    Type mean_fec = 0;
+    for(int a = 0; a < fec.size(); ++a){
+      mean_fec += dprob(a)*fecS(a);
+    }
+    return mean_fec;
+  }
+
+  //The good one
+  template<class Type>
+  Type lifetime_reproductive_var2(vector<Type> &Z, vector<Type> &fec, Type theta){
+    vector<Type> surv = exp(-Z);
+    vector<Type> dprob = death_probs(Z);
+    vector<Type> nb_var(fec.size());
+    vector<Type> nb_varS(fec.size());
+    vector<Type> fecS(fec.size());
+    for(int a = 0; a < fec.size(); ++a){
+      nb_var(a) = fec(a)+pow(fec(a),2)/theta;
+    }
+
+    nb_varS(0) = nb_var(0);
+    fecS(0) = fec(0);
+    for(int a = 1; a < fec.size(); ++a){
+      nb_varS(a) = nb_var(a)+nb_varS(a-1);
+      fecS(a) = fec(a)+fecS(a-1);
+    }
+
+    Type firstsum = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      firstsum += dprob(a)*nb_varS(a);
+    }
+
+    Type secsum = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      secsum += pow(fecS(a),2)*(1-dprob(a))*dprob(a);
+    }
+
+    Type lastsum = 0.0;
+    for(int a = 1; a < fec.size(); ++a){
+      for(int j = 0; j < a; ++j){
+	lastsum += fecS(a)*dprob(a)*fecS(j)*dprob(j);
+      }
+    }
+
+    Type tot = firstsum+secsum-2*lastsum;
+    return tot;
+
+  }
+
+
+  template<class Type>
+  Type TRO(matrix<Type> &log_N,vector<Type> &fec,int juv_by){
+    vector<Type> log_Nyj = log_N.col(juv_by);
+    Type TRO = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      TRO += fec(a)*exp(log_Nyj(a));
+    }
+    return TRO;
+  }
+
+  template<class Type>
+  vector<Type> RO(matrix<Type> &log_N,vector<Type> &fec,int juv_by){
+    vector<Type> log_Nyj = log_N.col(juv_by);
+    vector<Type> RO(log_Nyj.size());
+    for(int a = 0; a < fec.size(); ++a){
+      RO(a) = fec(a)*exp(log_Nyj(a));
+    }
+    return RO;
+  }
+
+
+  template<class Type>
+  Type yearly_variance(vector<Type> &fec,vector<Type> nb_var,matrix<Type> &log_N, int by){
+      int A = log_N.rows();
+      vector<Type> ROy = RO(log_N,fec,by+1);
+      Type TROy = TRO(log_N,fec,by+1);
+
+      vector<Type> Nya(A);
+      Type Ny = 0.0;
+      for(int a = 0; a < A; ++a){
+	Nya(a) = exp(log_N(a,by));
+	Ny += exp(log_N(a,by));
+      }
+
+      Type firstsum = 0.0;
+      for(int a = 0; a < A; ++a){
+	firstsum += nb_var(a)*(Nya(a)/Ny);
+      }
+
+      Type secsum = 0.0;
+      for(int a = 0; a < A; ++a){
+	secsum += pow(fec(a),2)*(1-Nya(a)/Ny)*(Nya(a)/Ny);
+      }
+
+      Type lastsum = 0.0;
+      for(int a = 1; a < A; ++a){
+	for(int j = 0; j < a; ++j){
+	  lastsum += fec(a)*(Nya(a)/Ny)*fec(j)*(Nya(j)/Ny);
+	}
+      }
+
+      Type tot = firstsum + secsum-2*lastsum;
+      return tot;
+
+  }
+
+  template<class Type>
+  vector<Type> reproductive_value(vector<Type> &fec,vector<Type> &Z,Type growth_rate){
+    vector<Type> surv = exp(-Z);
+    vector<Type> v_is(fec.size()+1);
+    for(int i = 0; i < fec.size()+1; ++i){
+      v_is(i) = 0.0;
+    }
+    v_is(0) = 1.0;
+    Type l_i = 0.0;
+    for(int a = 1; a < fec.size(); ++a){
+      for(int j = a; j < fec.size(); ++j){
+	Type prod = 1.0;
+	for(int h = 0; h < j; ++h){
+	  prod *= surv(h);
+	  if(h == j-1){
+	    l_i = prod;
+	  }
+	}
+	v_is(a) += prod*fec(j)*pow(growth_rate,-j-1);
+
+      }
+      v_is(a) *= pow(growth_rate,a)/l_i;
+    }
+    return v_is;
+  }
+
+
+  template<class Type>
+  matrix<Type> make_leslie(vector<Type> &fec, vector<Type> &Z){
+    vector<Type> surv = exp(-Z);
+    matrix<Type> leslie(fec.size(),fec.size());
+    leslie.setZero();
+    leslie.row(0) = fec;
+    for(int i = 0; i < fec.size()-1; ++i){
+      leslie(i+1,i) = surv(i);
+    }
+    return leslie;
+  }
+
+  template<class Type>
+  Type gen_length(vector<Type> &fec, vector<Type> &Z,Type growth_rate){
+    vector<Type> surv = exp(-Z);
+    Type top = 0.0;
+    Type bot = 0.0;
+    for(int i = 0; i < fec.size();++i){
+      Rcout << "i is: " << i << std::endl;
+      Type prod = 1.0;
+      for(int j = 0; j < i; ++j){
+	prod *= surv(j);
+      }
+      //Rcout << "prod is: " << prod << std::endl;
+      top += (i+1)*fec(i)*prod*pow(growth_rate,-(i+1));
+      //bot += fec(i)*prod;
+    }
+    Type ret = top;
+    return ret;
+  }
+
+
+  template<class Type>
+  Type weighted_lambda(vector<Type> &log_Nyj, vector<Type> &fec){
+    Type w_lambda = 0.0;
+    Type tot_Nyj = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      tot_Nyj += exp(log_Nyj(a));
+    }
+    for(int a = 0; a < fec.size(); ++a){
+      w_lambda += fec(a)*exp(log_Nyj(a));
+    }
+    w_lambda = w_lambda/tot_Nyj;
+    return w_lambda;
+  }
+
+  template<class Type>
+  vector<Type> init_N(vector<Type> &Z,Type total_init_N){
+    vector<Type> ret_N(Z.size());
+    ret_N(0) = 1.0;
+    for(int a = 1; a < Z.size();++a){
+      ret_N(a) = ret_N(a-1)*exp(-Z(a-1));
+    }
+    ret_N /= ret_N.sum();
+    ret_N *= total_init_N;
+    return ret_N;
+  }
+
+
+  template<class Type>
+  Type Pr_POP(matrix<Type> &log_N,vector<Type> &fec, int j_by,int p_by,int p_sy){
+
+    //get total number of individals of sex j_sex born from parents of sex p_sex
+    vector<Type> log_Nyj = log_N.col(j_by);
+    Type TROyj = TRO(log_N,fec,j_by);
+
+    int p_age_yj = j_by-p_by-1;
+    Type eprob = (2*fec(p_age_yj))/(TROyj);
+
+    //If the parent is sampled before the juvenile is born then they have to survive
+    if(p_sy < j_by){
+      int p_age_sy = p_sy-p_by-1;
+      vector<Type> log_Nsy = log_N.col(p_sy);
+      //Just the number at age in juv birth year over number at age in parent sample year
+      Type Pr_surv = exp(log_Nyj(p_age_yj))/exp(log_Nsy(p_age_sy));
+      eprob *= Pr_surv;
+    }
+
+    return eprob;
+
+  }
+
+  template<class Type>
+  Type Pr_HSP(matrix<Type> &log_N,vector<Type> &fec, int i_by, int o_by){
+    int A = log_N.rows();
+    int a_diff = i_by-o_by;
+    Type eprob = 0.0;
+
+    for(int d = a_diff; d < A; ++d){
+      vector<Type> log_Nyi = log_N.col(i_by);
+      vector<Type> log_Nyo = log_N.col(o_by);
+
+      Type TROi = TRO(log_N,fec,i_by);
+      Type TROo = TRO(log_N,fec,o_by);
+
+      //parents age at o's birth
+      //I think this only works because maturity is age 1?
+      int p_age_o = d - a_diff;
+
+      Type prob_i = (2*fec(d))/(TROi);
+      Type prob_o = (2*fec(p_age_o))/(TROo);
+      eprob += exp(log_Nyo(p_age_o))*prob_o*prob_i;
+
+      //if the age difference is greater than 0 the parent must survive to i_by
+      if(a_diff > 0){
+	Type Pr_surv = exp(log_Nyi(d))/exp(log_Nyo(p_age_o));
+	eprob *= Pr_surv;
+      }
+
+    }
+
+    return eprob;
+  }  
+
+  template<class Type>
+  Type Pr_HSPSC(matrix<Type> &log_N,vector<Type> &fec,vector<Type> wlamb,vector<Type> &nb_var,int by){
+    int A = log_N.rows();
+    Type var_y = yearly_variance(fec,nb_var,log_N,by);
+
+    //find yearly mean 
+    vector<Type> ROy = RO(log_N,fec,by+1);
+    Type Nytot = 0.0;
+    for(int a = 0; a < A; ++a){
+      Nytot += exp(log_N(a,by));
+    }
+
+    Type mean_y = wlamb[by];
+
+
+
+    Type eprob = 0.0;
+
+      eprob = (1/(Nytot/2.0))*(1+(var_y-mean_y)/pow(mean_y,2));
+
+
+    return eprob;
+
+  }
+#+end_src
+
+
+** Negative Binomial Version
+
+This model assumes a negative binomial variance.
+
+#+begin_src C++ :tangle ./models/ssmodelAdj.cpp :noweb yes :mkdirp yes
+<<commonbegin>>
+
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+
+    //Parameters
+    PARAMETER(log_init_tot_N);
+    PARAMETER_VECTOR(log_M);
+    PARAMETER_VECTOR(log_fecundity);
+    PARAMETER(log_theta);
+
+
+    //Transformations
+    Type init_tot_N = exp(log_init_tot_N);
+    vector<Type> Z = exp(log_M);
+    vector<Type> fecundity = exp(log_fecundity);
+    Type theta = exp(log_theta);
+
+    //Data
+    DATA_INTEGER(Y);
+    DATA_INTEGER(A);
+    DATA_INTEGER(skipsame);
+
+    DATA_IMATRIX(POPs);
+    DATA_IMATRIX(SIBsXC);
+    DATA_IMATRIX(SIBsSC);
+    DATA_IMATRIX(SIBsSCP);
+
+    //Pop Dynamics
+    matrix<Type> log_N(A,Y);
+    matrix<Type> N(A,Y);
+    N = log_N.array().exp();
+
+    //Death matrix
+    matrix<Type> D(A,Y);
+
+    vector<Type> init_N_v = init_N(Z,init_tot_N);
+    log_N.col(0) = log(init_N_v);
+
+    for(int y = 1; y < Y; ++y){
+      Type TROy = TRO(log_N,fecundity,y-1);
+      log_N(0,y) = log(TROy);
+      for(int a = 1; a < A; ++a){
+	log_N(a,y) = log_N(a-1,y-1)-Z(a-1);
+      }
+    }
+
+    for(int y = 0; y < Y; ++y){
+      for(int a = 0; a < A; ++a){
+	D(a,y) = exp(log_N(a,y))-exp(log_N(a,y)-Z(a));
+	if(a == A-1){
+	  D(a,y) = exp(log_N(a,y));
+	}
+      }
+    }
+
+    //Average lambdas each year, weighted by pop
+    vector<Type> w_lambdas(Y);
+    //The variance of reproductive success 
+    vector<Type> nb_var(A);
+
+    for(int a = 0; a < A; ++a){
+      nb_var(a) = fecundity(a)+pow(fecundity(a),2)/theta;
+    }
+
+    for(int y = 0; y < Y; ++y){
+      vector<Type> log_Ny = log_N.col(y);
+      w_lambdas(y) = weighted_lambda(log_Ny,fecundity);
+    }
+
+    Type nll = 0.0;
+
+    //Observation Model
+
+    //POPs
+    for(int i = 0; i < POPs.rows(); ++i){
+      int juv_by = POPs(i,0);
+      int juv_sy = POPs(i,1);
+      int par_by = POPs(i,2);
+      int par_sy = POPs(i,3);
+      Type n_comps = Type(POPs(i,4));
+      Type n_POPs = Type(POPs(i,5));
+
+      Type eprob = Pr_POP(log_N,fecundity,juv_by,par_by,par_sy);
+      Type eobs = eprob*n_comps;
+      nll -= dpois(n_POPs,eobs,true);
+
+    }
+
+    //Sibs Cross Cohort
+    for(int i = 0; i < SIBsXC.rows(); ++i){
+      int i_by = SIBsXC(i,0);
+      int i_sy = SIBsXC(i,1);
+      int o_by = SIBsXC(i,2);
+      int o_sy = SIBsXC(i,3);
+      Type n_comps = Type(SIBsXC(i,4));
+      Type n_SIBsXC = Type(SIBsXC(i,5));
+
+      Type eprob = Pr_HSP(log_N,fecundity,i_by,o_by);
+      Type eobs = eprob*n_comps;
+      nll -= dpois(n_SIBsXC,eobs,true);
+
+    }
+
+    //Sibs Same Cohort
+    vector<Type> SSCexp(SIBsSCP.rows());
+    vector<Type> SSCprob(SIBsSCP.rows());
+    vector<Type> varys(SIBsSCP.rows());
+      for(int i = 0; i < SIBsSCP.rows(); ++i){
+      int i_by = SIBsSCP(i,0);
+      varys(i) = yearly_variance(fecundity,nb_var,log_N,i_by);
+      Type n_comps = Type(SIBsSCP(i,2));
+      Type n_SIBsSCP = Type(SIBsSCP(i,1));
+
+      Type eprob = Pr_HSPSC(log_N,fecundity,w_lambdas,nb_var,i_by);
+      Type eobs = eprob*n_comps;
+      eobs = 2.0*eobs;
+      SSCexp(i) = eobs;
+      SSCprob(i) = eprob;
+      if(skipsame == false){
+	nll -= dpois(n_SIBsSCP,eobs,true);
+      }
+
+    }
+
+      REPORT(varys);
+      REPORT(SSCexp);
+      REPORT(SSCprob);
+
+
+    matrix<Type> les = make_leslie(fecundity,Z);
+    REPORT(les);
+
+    using namespace Eigen;
+    ComplexEigenSolver<Matrix<Type, Dynamic, Dynamic> > es(les);
+    vector<Type> EvR = es.eigenvalues().real();
+    vector<Type> EvRA = EvR.abs();
+    Type growth_rate = max(EvRA);
+    matrix<Type> VR = es.eigenvectors().real();
+
+    ComplexEigenSolver<Matrix<Type, Dynamic, Dynamic> > es2(les.transpose());
+    vector<Type> EvRL = es2.eigenvalues().real();
+    vector<Type> EvRAL = EvRL.abs();
+    matrix<Type> VL = es2.eigenvectors().real();
+    vector<Type> rp = VL.col(A-1);
+    vector<Type> rp2 = rp/rp(0);
+    vector<Type> rp3 = rp2/sum(rp2);
+
+
+    vector<Type> repro_value = reproductive_value(fecundity,Z,growth_rate);
+    REPORT(repro_value);
+    vector<Type> ls = get_ls(Z);
+    REPORT(ls);
+    REPORT(growth_rate);
+    vector<Type> var_a(A);
+    for(int a = 0; a < A; ++a){
+      var_a(a) = 2*fecundity(a)+pow(2*fecundity(a),2)/theta;
+    }
+    vector<Type> var_ab(A);
+    var_ab(0) = var_a(0);
+    for(int a = 1; a < A; ++a){
+      var_ab(a) = var_a(a)+var_ab(a-1);
+    }
+    REPORT(var_a);
+    REPORT(var_ab);
+    vector<Type> surv = exp(-Z);
+    REPORT(surv);
+
+
+    //Adjusted fecundity because you gotta account for the number of kids everybody has
+    vector<Type> doub_fec(fecundity.size());
+    for(int a = 0; a < fecundity.size(); ++a){
+      doub_fec(a) = 2.0*fecundity(a);
+    }
+
+
+    Type Vk = lifetime_reproductive_var2(Z,doub_fec,theta);
+    Type kbar = lifetime_reproductive_mean(Z,doub_fec);
+    REPORT(kbar);
+    ADREPORT(kbar);
+    REPORT(Vk);
+    ADREPORT(Vk);
+
+    //N_e guesstimate
+    Type glen = gen_length(fecundity,Z,growth_rate);
+    REPORT(glen);
+    vector<Type> N_e(Y);
+    for(int y = 0; y < Y; ++y){
+      Type Nby = exp(log_N(0,y));
+      Type topS = (2.0*Nby-1)*kbar*glen;
+      Type botS = 2.0*(1.0+Vk/kbar);
+      N_e(y) = topS/botS;
+    }
+
+
+
+    REPORT(EvR);
+    REPORT(D);
+    REPORT(VR);
+    REPORT(VL);
+    REPORT(rp2);
+    REPORT(rp3);
+    REPORT(log_N);
+    REPORT(N);
+    REPORT(fecundity);
+    REPORT(theta);
+    REPORT(Z);
+    REPORT(w_lambdas);
+    REPORT(nb_var);
+    REPORT(N_e);
+    ADREPORT(N_e);
+    ADREPORT(growth_rate);
+    ADREPORT(log_N);
+    //REPORT(same_cohort_exp);
+    return nll;
+
+
+  }
+#+end_src
+
+** No Same Cohort
+
+The model without same cohort comparisons.
+
+#+begin_src C++ :tangle ./models/ssmodelNoSC.cpp :noweb yes
+<<commonbegin>>
+
+
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+
+    //Parameters
+    PARAMETER(log_init_tot_N);
+    PARAMETER_VECTOR(log_M);
+    PARAMETER_VECTOR(log_fecundity);
+
+    //Transformations
+    Type init_tot_N = exp(log_init_tot_N);
+    vector<Type> Z = exp(log_M);
+    vector<Type> fecundity = exp(log_fecundity);
+
+    //Data
+    DATA_INTEGER(Y);
+    DATA_INTEGER(A);
+
+    DATA_IMATRIX(POPs);
+    DATA_IMATRIX(SIBsXC);
+
+    //Pop Dynamics
+    matrix<Type> log_N(A,Y);
+    matrix<Type> N(A,Y);
+    N = log_N.array().exp();
+
+    //Death matrix
+    matrix<Type> D(A,Y);
+
+    vector<Type> init_N_v = init_N(Z,init_tot_N);
+    log_N.col(0) = log(init_N_v);
+
+    for(int y = 1; y < Y; ++y){
+      Type TROy = TRO(log_N,fecundity,y-1);
+      log_N(0,y) = log(TROy);
+      for(int a = 1; a < A; ++a){
+	log_N(a,y) = log_N(a-1,y-1)-Z(a-1);
+      }
+    }
+
+    for(int y = 0; y < Y; ++y){
+      for(int a = 0; a < A; ++a){
+	D(a,y) = exp(log_N(a,y))-exp(log_N(a,y)-Z(a));
+	if(a == A-1){
+	  D(a,y) = exp(log_N(a,y));
+	}
+      }
+    }
+
+
+    Type nll = 0.0;
+
+    //Observation Model
+
+    //POPs
+    for(int i = 0; i < POPs.rows(); ++i){
+      int juv_by = POPs(i,0);
+      int juv_sy = POPs(i,1);
+      int par_by = POPs(i,2);
+      int par_sy = POPs(i,3);
+      Type n_comps = Type(POPs(i,4));
+      Type n_POPs = Type(POPs(i,5));
+
+      Type eprob = Pr_POP(log_N,fecundity,juv_by,par_by,par_sy);
+      Type eobs = eprob*n_comps;
+      nll -= dpois(n_POPs,eobs,true);
+
+    }
+
+    //Sibs Cross Cohort
+    for(int i = 0; i < SIBsXC.rows(); ++i){
+      int i_by = SIBsXC(i,0);
+      int i_sy = SIBsXC(i,1);
+      int o_by = SIBsXC(i,2);
+      int o_sy = SIBsXC(i,3);
+      Type n_comps = Type(SIBsXC(i,4));
+      Type n_SIBsXC = Type(SIBsXC(i,5));
+
+      Type eprob = Pr_HSP(log_N,fecundity,i_by,o_by);
+      Type eobs = eprob*n_comps;
+      nll -= dpois(n_SIBsXC,eobs,true);
+
+    }
+
+
+    matrix<Type> les = make_leslie(fecundity,Z);
+    REPORT(les);
+
+    using namespace Eigen;
+    ComplexEigenSolver<Matrix<Type, Dynamic, Dynamic> > es(les);
+    vector<Type> EvR = es.eigenvalues().real();
+    vector<Type> EvRA = EvR.abs();
+    Type growth_rate = max(EvRA);
+
+
+    REPORT(log_N);
+    ADREPORT(log_N);
+    REPORT(N);
+    REPORT(fecundity);
+    REPORT(Z);
+    ADREPORT(growth_rate);
+    return nll;
+
+  }
+#+end_src
+
+** Mean variance power relationship
+
+#+begin_src C++ :tangle ./models/ssmodelMVP.cpp :noweb yes
+  <<commonbegin>>
+
+
+    ///Because I sillyly hard coded this to use NB variance I need a new version
+  template<class Type>
+  Type lifetime_reproductive_var3(vector<Type> &Z, vector<Type> &fec, Type theta,Type var_power){
+    vector<Type> surv = exp(-Z);
+    vector<Type> dprob = death_probs(Z);
+    vector<Type> nb_var(fec.size());
+    vector<Type> nb_varS(fec.size());
+    vector<Type> fecS(fec.size());
+    for(int a = 0; a < fec.size(); ++a){
+      nb_var(a) = theta*pow(fec(a),var_power);
+    }
+
+    nb_varS(0) = nb_var(0);
+    fecS(0) = fec(0);
+    for(int a = 1; a < fec.size(); ++a){
+      nb_varS(a) = nb_var(a)+nb_varS(a-1);
+      fecS(a) = fec(a)+fecS(a-1);
+    }
+
+    Type firstsum = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      firstsum += dprob(a)*nb_varS(a);
+    }
+
+    Type secsum = 0.0;
+    for(int a = 0; a < fec.size(); ++a){
+      secsum += pow(fecS(a),2)*(1-dprob(a))*dprob(a);
+    }
+
+    Type lastsum = 0.0;
+    for(int a = 1; a < fec.size(); ++a){
+      for(int j = 0; j < a; ++j){
+	lastsum += fecS(a)*dprob(a)*fecS(j)*dprob(j);
+      }
+    }
+
+    Type tot = firstsum+secsum-2*lastsum;
+    return tot;
+
+  }
+
+
+    template<class Type>
+    Type objective_function<Type>::operator() ()
+    {
+
+      //Parameters
+      PARAMETER(log_init_tot_N);
+      PARAMETER_VECTOR(log_M);
+      PARAMETER_VECTOR(log_fecundity);
+      //Theta here is a constant c
+      PARAMETER(log_theta);
+      PARAMETER(var_power);
+
+      //Transformations
+      Type init_tot_N = exp(log_init_tot_N);
+      vector<Type> Z = exp(log_M);
+      vector<Type> fecundity = exp(log_fecundity);
+      Type theta = exp(log_theta);
+
+      //Data
+      DATA_INTEGER(Y);
+      DATA_INTEGER(A);
+      DATA_INTEGER(skipsame);
+
+      DATA_IMATRIX(POPs);
+      DATA_IMATRIX(SIBsXC);
+      DATA_IMATRIX(SIBsSC);
+      DATA_IMATRIX(SIBsSCP);
+
+      //Pop Dynamics
+      matrix<Type> log_N(A,Y);
+      matrix<Type> N(A,Y);
+      N = log_N.array().exp();
+
+      //Death matrix
+      matrix<Type> D(A,Y);
+
+      vector<Type> init_N_v = init_N(Z,init_tot_N);
+      log_N.col(0) = log(init_N_v);
+
+      for(int y = 1; y < Y; ++y){
+	Type TROy = TRO(log_N,fecundity,y-1);
+	log_N(0,y) = log(TROy);
+	for(int a = 1; a < A; ++a){
+	  log_N(a,y) = log_N(a-1,y-1)-Z(a-1);
+	}
+      }
+
+      for(int y = 0; y < Y; ++y){
+	for(int a = 0; a < A; ++a){
+	  D(a,y) = exp(log_N(a,y))-exp(log_N(a,y)-Z(a));
+	  if(a == A-1){
+	    D(a,y) = exp(log_N(a,y));
+	  }
+	}
+      }
+
+      //Average lambdas each year, weighted by pop
+      vector<Type> w_lambdas(Y);
+      //The variance of reproductive success at age
+      //here it's not really neg bin...
+      vector<Type> nb_var(A);
+
+      for(int a = 0; a < A; ++a){
+	nb_var(a) = theta*pow(fecundity(a),var_power);
+      }
+
+      for(int y = 0; y < Y; ++y){
+	vector<Type> log_Ny = log_N.col(y);
+	w_lambdas(y) = weighted_lambda(log_Ny,fecundity);
+      }
+
+      Type nll = 0.0;
+
+      //Observation Model
+
+      //POPs
+      for(int i = 0; i < POPs.rows(); ++i){
+	int juv_by = POPs(i,0);
+	int juv_sy = POPs(i,1);
+	int par_by = POPs(i,2);
+	int par_sy = POPs(i,3);
+	Type n_comps = Type(POPs(i,4));
+	Type n_POPs = Type(POPs(i,5));
+
+	Type eprob = Pr_POP(log_N,fecundity,juv_by,par_by,par_sy);
+	Type eobs = eprob*n_comps;
+	nll -= dpois(n_POPs,eobs,true);
+
+      }
+
+      //Sibs Cross Cohort
+      for(int i = 0; i < SIBsXC.rows(); ++i){
+	int i_by = SIBsXC(i,0);
+	int i_sy = SIBsXC(i,1);
+	int o_by = SIBsXC(i,2);
+	int o_sy = SIBsXC(i,3);
+	Type n_comps = Type(SIBsXC(i,4));
+	Type n_SIBsXC = Type(SIBsXC(i,5));
+
+	Type eprob = Pr_HSP(log_N,fecundity,i_by,o_by);
+	Type eobs = eprob*n_comps;
+	nll -= dpois(n_SIBsXC,eobs,true);
+
+      }
+
+      //Sibs Same Cohort
+      vector<Type> SSCexp(SIBsSCP.rows());
+      vector<Type> SSCprob(SIBsSCP.rows());
+      vector<Type> varys(SIBsSCP.rows());
+	for(int i = 0; i < SIBsSCP.rows(); ++i){
+	int i_by = SIBsSCP(i,0);
+	varys(i) = yearly_variance(fecundity,nb_var,log_N,i_by);
+	Type n_comps = Type(SIBsSCP(i,2));
+	Type n_SIBsSCP = Type(SIBsSCP(i,1));
+
+	Type eprob = Pr_HSPSC(log_N,fecundity,w_lambdas,nb_var,i_by);
+	Type eobs = eprob*n_comps;
+	eobs = 2.0*eobs;
+	SSCexp(i) = eobs;
+	SSCprob(i) = eprob;
+	if(skipsame == false){
+	  nll -= dpois(n_SIBsSCP,eobs,true);
+	}
+
+      }
+
+	REPORT(varys);
+	REPORT(SSCexp);
+	REPORT(SSCprob);
+
+
+      matrix<Type> les = make_leslie(fecundity,Z);
+      REPORT(les);
+
+      using namespace Eigen;
+      ComplexEigenSolver<Matrix<Type, Dynamic, Dynamic> > es(les);
+      vector<Type> EvR = es.eigenvalues().real();
+      vector<Type> EvRA = EvR.abs();
+      Type growth_rate = max(EvRA);
+      matrix<Type> VR = es.eigenvectors().real();
+
+      ComplexEigenSolver<Matrix<Type, Dynamic, Dynamic> > es2(les.transpose());
+      vector<Type> EvRL = es2.eigenvalues().real();
+      vector<Type> EvRAL = EvRL.abs();
+      matrix<Type> VL = es2.eigenvectors().real();
+      vector<Type> rp = VL.col(A-1);
+      vector<Type> rp2 = rp/rp(0);
+      vector<Type> rp3 = rp2/sum(rp2);
+
+
+      vector<Type> repro_value = reproductive_value(fecundity,Z,growth_rate);
+      REPORT(repro_value);
+      vector<Type> ls = get_ls(Z);
+      REPORT(ls);
+      REPORT(growth_rate);
+      vector<Type> var_a(A);
+      for(int a = 0; a < A; ++a){
+	var_a(a) = 2*fecundity(a)+pow(2*fecundity(a),2)/theta;
+      }
+      vector<Type> var_ab(A);
+      var_ab(0) = var_a(0);
+      for(int a = 1; a < A; ++a){
+	var_ab(a) = var_a(a)+var_ab(a-1);
+      }
+      REPORT(var_a);
+      REPORT(var_ab);
+      vector<Type> surv = exp(-Z);
+      REPORT(surv);
+
+
+      //Adjusted fecundity because you gotta account for the number of kids everybody has
+      vector<Type> doub_fec(fecundity.size());
+      for(int a = 0; a < fecundity.size(); ++a){
+	doub_fec(a) = 2.0*fecundity(a);
+      }
+
+
+      Type Vk = lifetime_reproductive_var3(Z,doub_fec,theta,var_power);
+      Type kbar = lifetime_reproductive_mean(Z,doub_fec);
+      REPORT(kbar);
+      ADREPORT(kbar);
+      REPORT(Vk);
+      ADREPORT(Vk);
+
+      //N_e guesstimate
+      Type glen = gen_length(fecundity,Z,growth_rate);
+      REPORT(glen);
+      vector<Type> N_e(Y);
+      for(int y = 0; y < Y; ++y){
+	Type Nby = exp(log_N(0,y));
+	Type topS = (2.0*Nby-1)*kbar*glen;
+	Type botS = 2.0*(1.0+Vk/kbar);
+	N_e(y) = topS/botS;
+      }
+
+
+
+      REPORT(EvR);
+      REPORT(D);
+      REPORT(VR);
+      REPORT(VL);
+      REPORT(rp2);
+      REPORT(rp3);
+      REPORT(log_N);
+      REPORT(N);
+      REPORT(fecundity);
+      REPORT(theta);
+      REPORT(Z);
+      REPORT(w_lambdas);
+      REPORT(nb_var);
+      REPORT(N_e);
+      ADREPORT(N_e);
+      ADREPORT(growth_rate);
+      ADREPORT(log_N);
+      //REPORT(same_cohort_exp);
+      return nll;
+
+
+    }
+#+end_src
+
+* R code
+
+** qsim.R
+
+
+*** simulate_markers
+
+~simulate_markers~ simulates genetic markers based on a ~data.frame~ containing
+the genotypes for each locus, which locus those genotypes correspond to and
+the frequency in which they appear in the starting population. This is
+used when building the founding population. 
+
+#+begin_src R :eval never :tangle ./R/varCKMR.R :mkdirp yes
+#' Simulate from markers dataframe
+#'
+#' @param markers dataframe with the marker information geno,locus then freqs
+#' @param n The number to simulate.
+#' @export
+simulate_markers <- function(markers,n){
+    samp = tapply(1:nrow(markers),markers$locus,
+                  FUN=function(x,n){
+                      geno = markers$geno[x]
+                      prob = markers$freqs[x]
+                      y= sample(geno,2*n,TRUE,prob)
+                      y},n=n)
+    samp2 = lapply(seq_along(samp),function(x){
+        larp = data.table(matrix(samp[[x]],ncol=2))
+        names(larp) = paste0("m_",names(samp[x]),"_",c("A","B"))
+        larp
+    })
+    do.call(cbind,samp2)    
+} 
+#+end_src
+
+*** create_founding_pop
+
+    ~create_founding_pop~ creates a founding population given a ~data.frame~
+    with the intial population numbers at age, ~init_N~, a ~data.frame~
+    containing the markers to be used in the simulation along with their
+    frequency as well as functions defining the probability of an individual surviving
+    onto the next year and whether they are mature or not as well their mean fecundity
+    at age.
+    
+#+begin_src R :eval never :tangle ./R/qsim.R
+#' Create a founding population
+#'
+#' @param init_N dataframe with the initial population details, must be Age, Sex then N
+#' @param markers dataframe with information on markers must be geno, locus then freqs
+#' @param maturity_fun The function that specifies at what age they become mature
+#' @param surv_fun the survival function
+#' @param fecund_fun the mean fecundity at age function
+#'
+#' @import data.table
+#' @export
+create_founding_pop <- function(init_N,markers,maturity_fun,surv_fun,fecund_fun){
+    dt = data.table(init_N)
+    smt = simulate_markers(markers,1)
+    dt = dt[rep(seq_len(nrow(dt)),N)]
+    dt[, `:=`(birth_year=0-Age,
+              mother=NA,
+              father=NA,
+              cur_year = 0,
+              alive = TRUE,
+              u = runif(.N),
+              ID=seq_len(nrow(dt)))]
+    dt[,mature := (u <= maturity_fun(Age))]
+    dt[,N:=NULL]
+    dt[,Age:=NULL]
+    dt[,u:=NULL]
+
+    dt[,names(smt) := simulate_markers(markers,nrow(dt)),]
+
+    smtlist = split(names(smt),ceiling(seq_along(names(smt))/2))
+
+    ret = list(population= dt,markers=markers,init_N=init_N,
+               maturity_fun=maturity_fun,surv_fun= surv_fun,fecund_fun= fecund_fun,
+               smtlist = smtlist,namsmt=names(smt))
+    
+    ret
+} 
+#+end_src
+
+*** yearly_deaths
+
+    ~yearly_deaths~ applies the provided survival function to the provided population
+    to determine which individuals survive to the next year.
+    
+    #+begin_src R :eval never :tangle ./R/qsim.R
+
+#' Death function
+#'
+#' Given a population and survival function choose who dies
+#'
+#' @param population the population to have individuals die in
+#' @param surv_fun the survival function giving the probability of an individual making it to next year
+#' @export
+yearly_deaths <- function(population,year_now){
+
+    setkey(population$population,cur_year,alive)
+    
+    new_year = data.table::copy(population$population[.(year_now-1,TRUE)])
+
+    new_year[,cur_year := year_now]
+    
+    setkey(new_year,alive,cur_year)
+    new_year[,age := cur_year - birth_year][.(TRUE,year_now),u := runif(.N)][.(TRUE,year_now),alive := (u <= population$surv_fun(age))]
+    setkey(new_year,alive,mature,cur_year)
+    new_year[.(TRUE,FALSE,year_now),w := runif(.N)][.(TRUE,FALSE,year_now),mature := (w <= population$maturity_fun(age))] 
+    new_year[,age := NULL][,u := NULL][,w := NULL]
+
+    population$population = rbind(population$population,new_year)
+    population
+    
+
+}      
+    #+end_src
+
+    
+
+*** breed_one_year_fonly
+
+    ~breed_one_year_fonly~ will breed a population of only females that are
+    mature for one year. This is simular to ~breed_one_year~ but just for
+    the simulation case with just 1 sex. It assumes that offspring of an
+    individual are generated according to the Poisson distribution.[
+
+    #+begin_src R :eval never :tangle ./R/qsim.R
+#' Breed 1 year for females only
+#'
+#' Select mature inviduals breed them together to create new kids!
+#'
+#' @param population the population to breed
+#' @export
+breed_one_year_fonly <- function(population,year_now,n_babies){
+
+      setkey(population$population,alive,mature,cur_year,Sex)
+    population$population[,age := cur_year-birth_year]
+
+    mums = population$population[.(TRUE,TRUE,year_now,"female"),]
+    mums = mums[,nkids := n_babies(age+1,.N,population)]
+
+    faths = population$population[.(TRUE,TRUE,year_now,"male"),]
+    IDmax = max(population$population$ID)+1
+
+    glue = c("nkids","ID",population$namsmt)
+    
+    new_kids = mums[,..glue]
+    setnames(new_kids,"ID","mother")
+    new_kids = new_kids[rep(seq_len(nrow(new_kids)),nkids)]
+    new_kids[, `:=`(birth_year=year_now+1,
+                    father=NA,
+                    cur_year=year_now+1,
+                    alive = TRUE,
+                    mature = FALSE,
+                    Sex = sample(c("female"),.N,TRUE),
+                    ID = seq(IDmax,length.out = nrow(new_kids)))]
+    mums[,nkids := NULL]
+    population$population[,age := NULL]
+    new_kids[,nkids := NULL]
+    setcolorder(new_kids,names(population$population))
+
+    population$population = rbind(population$population,new_kids)
+    population
+
+}
+
+      
+    #+end_src
+
+
+*** deaths_breed_one_year
+
+    ~deaths_breed_one_year~ first performs the deaths of the year and then there is a random breeding
+    component.
+
+    #+begin_src R :eval never :tangle ./R/qsim.R
+      #' Deaths and then randomly breed 2 sexes
+      #' @param population  the population to die and breed in
+      #' @param year_now the current year of the simulation
+      #' @param n_babies function describing the distribution how offspring are generated
+      #' @export
+      deaths_breed_one_year <- function(population,year_now,n_babies){
+          setkey(population$population,cur_year,alive)
+          new_deaths = data.table::copy(population$population[.(year_now-1,TRUE)])
+
+          new_deaths[,cur_year := year_now]
+
+              
+          setkey(new_deaths,alive,cur_year)
+          new_deaths[,age := cur_year - birth_year][.(TRUE,year_now),u := runif(.N)][.(TRUE,year_now),alive := (u <= population$surv_fun(age))]
+          setkey(new_deaths,alive,mature,cur_year)
+          new_deaths[.(TRUE,FALSE,year_now),w := runif(.N)][.(TRUE,FALSE,year_now),mature := (w <= population$maturity_fun(age))] 
+          new_deaths[,u := NULL][,w := NULL]
+
+          setkey(new_deaths,alive,mature,cur_year,Sex)
+
+          
+          mums = new_deaths[.(TRUE,TRUE,year_now,"female"),]
+          mums = mums[,nkids := n_babies(age+1,.N,new_deaths)*2]
+
+          faths = new_deaths[.(TRUE,TRUE,year_now,"male"),]
+          IDmax = max(population$population$ID)+1
+
+          glue = c("nkids","ID",population$namsmt)
+
+          new_kids = mums[,..glue]
+          setnames(new_kids,"ID","mother")
+          new_kids = new_kids[rep(seq_len(nrow(new_kids)),nkids)]
+          new_kids[, `:=`(birth_year=year_now+1,
+                          father=NA,
+                          cur_year=year_now+1,
+                          alive = TRUE,
+                          mature = FALSE,
+                          Sex = sample(c("male","female"),.N,TRUE),
+                          ID = seq(IDmax,length.out = nrow(new_kids)))]
+          mums[,nkids := NULL]
+          population$population[,age := NULL]
+          new_kids[,nkids := NULL]
+          setcolorder(new_kids,names(population$population))
+
+          
+          new_kids[,father := sample(faths$ID,.N,replace=TRUE)]
+          kids_markers = samp_markers(population$smtlist,nrow(new_kids))
+          
+          marks = c("ID",population$namsmt)
+          setkey(population$population,ID)
+          DNAs = unique(population$population[.(ID = new_kids$father),..marks])
+          allDNAs = as.data.frame(merge(new_kids,DNAs,by.x="father",by.y="ID",suffixes = c("",".m")))
+          allDNAs2 = allDNAs
+
+          
+          gloop = system.time({    picksL = as.data.frame(as.table(kids_markers))
+              picksL$Var1 = as.numeric(picksL$Var1)
+              picksL$Var2 = as.numeric(picksL$Var2)+min(new_kids$ID)-1
+              names(picksL) = c("whocares","ID","marker")
+
+              new_kidsL = melt(new_kids,measure.vars=population$namsmt,value.name="geno",variable.name="marker")
+              new_kidsL$marker = as.character(new_kidsL$marker)
+              DNAsL = melt(DNAs,measure.vars=population$namsmt,value.name="geno",variable.name="marker")
+              names(DNAsL)[1] = "father"
+              setkey(new_kidsL,ID,marker)
+              grab = new_kidsL[picksL[,2:3],.(father,marker)]
+              setkey(DNAsL,father,marker)
+              new_kidsL[picksL[,2:3],"geno"] = DNAsL[grab,3]
+              DNAsL[grab]
+              new_kids = dcast(new_kidsL,Sex+birth_year+mother+father+cur_year+alive+ID+mature ~ marker,
+                               value.var = "geno")
+          })
+          
+          population$population = rbind(population$population,new_kids)
+          population
+
+          
+      }
+      
+      
+    #+end_src
+
+*** generate_kids_od
+
+Given a list of mature individual IDs, their ages and sex as well as their average fecundity as well the
+overdispersion parameter then generate the kids resulting from their random mating assuming an overdispered
+Poisson distribution.
+
+#+begin_src R :eval never :tangle ./R/qsim.R
+  #' Generate kids randomly with overdispersion
+  #' 
+  #' Generate the list of kids born this year
+  #' @param IDs vector of IDs
+  #' @param ages vector of ages
+  #' @param sex vector of individuals sex
+  #' @param ave_fecun the average fecundity at age (matrix one column for each sex)
+  #' @param overdispersion overdispersion parameter (one for each sex)
+  #'
+  #' @export
+  #'
+  generate_kids_od <- function(IDs,ages,sex,ave_fecun,overdispersion){
+    df = data.frame(ID=IDs,sex=sex,age=ages,sex_num=as.numeric(as.factor(sex)))
+    ave_numkids = table(df$sex,df$age)[1,]*ave_fecun[,1]
+    numkids = rpois(3,ave_numkids)
+    ##Trying this?
+    tot_kids = sum(2*ave_numkids)
+    sdf = df |>
+      dplyr::group_by(sex_num) |>
+      dplyr::mutate(overd = overdispersion[sex_num]) |>
+      dplyr::mutate(E = rgamma(dplyr::n(),overd)) |>
+      dplyr::mutate(fecun = ave_fecun[cbind(age,sex_num)]*E) |>
+      dplyr::mutate(nkids = rmultinom(1,tot_kids,fecun))
+
+    sdf = split(sdf,sdf$sex)
+
+    ##sample the labels to generate parents
+    kidlabs = lapply(sdf,function(x){
+      sample(rep(x$ID,x$nkids))
+    })
+    kids = do.call(cbind,kidlabs)
+    kids
+
+
+  }
+
+
+
+
+#+end_src
+
+*** breed_one_year_od
+
+A fixed version of ~breed_one_year~ but with support for overdispersion and different sex ratios.  
+Note that the ~population~ fecundity and survival functions are now assumed to operate by sex.
+
+#+begin_src R :eval never :tangle ./R/qsim.R
+    #' Breed one year with 2 sexes, overdispersion and sex ratios
+    #'
+    #' @param population the population to breed
+    #' @param year_now the current year
+    #' @param overdispersion the vector with the overdispersion parameter for each sex
+    #' @param sex_fraction fraction of population that is male
+    #'
+    #' @export
+    breed_one_year_od <- function(population,year_now,overdispersion,sex_fraction){
+      setkey(population$population,alive,mature,cur_year)
+      population$population[,age := cur_year-birth_year]
+
+      mature = population$population[.(TRUE,TRUE,year_now),]
+      ages = sort(unique(mature$age))
+      ave_fecun_f = population$fecund_fun(ages,rep("female",length(ages)))
+      ave_fecun_m = population$fecund_fun(ages,rep("male",length(ages)))
+      ave_fecun = cbind(ave_fecun_f,ave_fecun_m)
+      kids = as.data.frame(generate_kids_od(mature$ID,mature$age,mature$Sex,ave_fecun,overdispersion))
+
+      new_kids = data.table(Sex = sample(c("male","female"),nrow(kids),TRUE,c(sex_fraction,1-sex_fraction)),
+			      birth_year = year_now,
+			      mother=kids$female,
+			      father=kids$male,
+			      cur_year = year_now+1,
+			      alive=TRUE,
+			      ID = (max(population$population$ID)+1):(max(population$population$ID)+nrow(kids)),
+			      mature = TRUE)
+      ##   namsmt = c(population$namsmt,"ID")
+      ##   mom_marks = mature[ID %in% new_kids$mother,..namsmt]
+      ##   setnames(mom_marks,"ID","mother")
+      ## new_kids = merge(new_kids,mom_marks,all.x=TRUE)
+
+      setkey(population$population,ID)
+      mdna = as.data.frame(population$population[.(new_kids$mother),])
+      fdna = as.data.frame(population$population[.(new_kids$father),])
+
+
+      nmarks = length(population$smtlist)
+  msamp = replicate(nrow(new_kids),paste0("m_",1:nmarks,"_",sample(c("A","B"),nmarks,TRUE)))
+  fsamp = replicate(nrow(new_kids),paste0("m_",1:nmarks,"_",sample(c("A","B"),nmarks,TRUE)))
+      msampcb = lapply(1:nrow(new_kids),function(x){
+	cbind(x,match(msamp[,x],names(mdna)))})
+      msampcb = do.call(rbind,msampcb)
+    fsampcb = lapply(1:nrow(new_kids),function(x){
+	cbind(x,match(fsamp[,x],names(fdna)))})
+      fsampcb = do.call(rbind,fsampcb)
+
+  mA = as.data.frame(matrix(as.numeric(mdna[msampcb]),nrow=nrow(new_kids),byrow=TRUE))
+  names(mA) = paste0("m_",1:nmarks,"_A")
+  mB = as.data.frame(matrix(as.numeric(fdna[fsampcb]),nrow=nrow(new_kids),byrow=TRUE))
+      names(mB) = paste0("m_",1:nmarks,"_B")
+      new_kids = cbind(new_kids,mA,mB)
+
+    ##kids_markers = samp_markers(population$smtlist,nrow(new_kids))
+
+
+    ##     marks = c("ID",population$namsmt)
+    ##     setkey(population$population,ID)
+    ##     DNAs = unique(population$population[.(ID = new_kids$father),..marks])
+    ##     allDNAs = as.data.frame(merge(new_kids,DNAs,by.x="father",by.y="ID",suffixes = c("",".m")))
+    ##     allDNAs2 = allDNAs
+
+
+    ## gloop = system.time({    picksL = as.data.frame(as.table(kids_markers))
+    ##     picksL$Var1 = as.numeric(picksL$Var1)
+    ##     picksL$Var2 = as.numeric(picksL$Var2)+min(new_kids$ID)-1
+    ##     names(picksL) = c("whocares","ID","marker")
+
+    ##     new_kidsL = melt(new_kids,measure.vars=population$namsmt,value.name="geno",variable.name="marker")
+    ##     new_kidsL$marker = as.character(new_kidsL$marker)
+    ##     DNAsL = melt(DNAs,measure.vars=population$namsmt,value.name="geno",variable.name="marker")
+    ##     names(DNAsL)[1] = "father"
+    ##     setkey(new_kidsL,ID,marker)
+    ##     grab = new_kidsL[picksL[,2:3],.(father,marker)]
+    ##     setkey(DNAsL,father,marker)
+    ##     new_kidsL[picksL[,2:3],"geno"] = DNAsL[grab,3]
+    ##     DNAsL[grab]
+    ##     new_kids = dcast(new_kidsL,Sex+birth_year+mother+father+cur_year+alive+ID+mature ~ marker,
+    ##       	       value.var = "geno")
+    ## })
+
+	##death bit
+	setkey(population$population,cur_year,alive)
+
+	new_year = data.table::copy(population$population[.(year_now,TRUE)])
+
+	setkey(new_year,alive,cur_year)
+	new_year[,age := cur_year - birth_year][.(TRUE,year_now),u := runif(.N)][.(TRUE,year_now),alive := (u <= population$surv_fun(age,Sex))]
+	setkey(new_year,alive,mature,cur_year)
+	new_year[.(TRUE,FALSE,year_now),w := runif(.N)][.(TRUE,FALSE,year_now),mature := (w <= population$maturity_fun(age))] 
+	new_year[,age := NULL][,u := NULL][,w := NULL]
+	  new_year[,cur_year := year_now+1]
+
+	population$population[,age :=NULL]
+
+	population$population = rbind(population$population,new_year)
+	data.table::setcolorder(new_kids,names(population$population))
+
+	population$population = rbind(population$population,new_kids)
+	population
+
+
+    }
+#+end_src
+
+
+    
+*** samp_non_fatally
+
+    ~samp_non_fatally~ samples a fraction of yearly without killing any individual using
+    a sampling quota. For
+    speed reasons this is actually to be done /after/ the simulation is complete as it's
+    quicker to operate on the whole population at once as opposed to year by year.
+
+    #+begin_src R :eval never :tangle ./R/qsim.R
+#' Sample yearly non-fatally
+#'
+#' This samples yearly non-fatally. It's meant to be run AFTER
+#' the simulation is complete as it randomly samples based on alive
+#' individuals in each of the years.
+#'
+#' @param population the population to sample
+#' @param sampquota the number at each age class to sample
+#' @param samp_years the number of years to sample
+#' @export
+samp_non_fatally <- function(sim,sampquota,samp_years){
+    sim$population[, age := cur_year - birth_year]
+    setkey(sim$population,cur_year,alive)
+    quts = expand.grid(sampquota,samp_years)
+
+    selected = sim$population[.(samp_years,TRUE),]
+    samps = selected[,.SD[sample(.N,sampquota[.BY$age+1])],by=.(age,cur_year)]
+    
+    sim$population[,age := NULL]
+    sim$samps = samps
+    sim
+}      
+    #+end_src  
+
+*** samp_non_fatally_frac
+
+    ~samp_non_fatally_frac~ is the same ~samp_non_fatally~ but randomly sampling
+    a fraction of the population instead of taking a quota sample.
+    #+begin_src R :eval never :tangle ./R/qsim.R
+#' Sample yearly non-fatally with a fraction
+#'
+#' This samples yearly non-fatally. It's meant to be run AFTER
+#' the simulation is complete as it randomly samples based on alive
+#' individuals in each of the years. This version uses a
+#' sampling fraction instead of a quota.
+#'
+#' @param population the population to sample
+#' @param sampfrac the fraction at each age class to sample
+#' @param samp_years the number of years to sample
+#' 
+#' @export
+samp_non_fatally_frac <- function(sim,sampfrac,samp_years){
+    sim$population[, age := cur_year - birth_year]
+    setkey(sim$population,cur_year,alive)
+
+    selected = sim$population[.(samp_years,TRUE),]
+    samps = selected[,.SD[sample(.N,.N*sampfrac[.BY$age+1])],by=.(age,cur_year)]
+    
+    sim$population[,age := NULL]
+    sim$samps = samps
+    sim
+}
+
+    #+end_src  
+
+*** make_ped
+
+    ~make_ped~ makes an ordered pedigree from a simulation population.
+
+    #+begin_src R :eval never :tangle ./R/qsim.R
+      #' make the pedigree of the indivduals
+      #'
+      #' @param indiv sim to get pedigree of
+      #' @export
+      make_ped <- function(indiv){
+          indiv$pedigree = unique(indiv$population,by=c("ID","mother","father"))
+          setorder(indiv$pedigree,ID)
+          indiv
+      }
+    #+end_src
+
+*** samp_markers
+
+
+~samp_markers~ is used during breeding to get the random sample from the markers by the way of ~smtlist~.
+    
+    #+begin_src R :eval never :tangle ./R/qsim.R
+      #' Sample markers from the population for breeding
+      #'
+      #' @param smtlist the list of markers used in the simulation
+      #' @param n the number to get back
+      #'
+      #' @export
+      samp_markers <- function(smtlist,n){
+          inds = replicate(length(smtlist),sample(1:2,n,replace=TRUE))
+          jammed = do.call(rbind,smtlist)
+          nams = apply(inds,1,function(x){jammed[cbind(seq_along(x),x)]})
+          nams
+      }
+    #+end_src
+    
+
+*** rough_sample_size
+
+~rough_sample_size~ generates a rough target sample size given 
+a function to use as multiplier. 
+
+#+begin_src R :eval never :tangle ./R/qsim.R
+  #' Generate rough sample size to target
+  #' @param tN matrix of true numbers at age
+  #' @param fun the function to use with 
+  #' @export
+  rough_sample_size <- function(tN,fun=function(y){10*sqrt(y)}){
+      samp = apply(tN,2,function(x){
+          s_est = fun(x)
+          ssize = rpois(1,s_est)
+          mprop = x/sum(x)
+          samp = ssize*mprop
+          floor(samp)
+      })
+      samp
+  }
+  
+#+end_src
+
+*** sample_age_by_year
+
+~sample_arge_by_year~ samples non-lethally by age using the
+targets specified in a matrix on a population generated by 
+the simulation. Output is a list of list as expected by 
+~find_POPs~.
+
+#+begin_src R :eval never :tangle ./R/qsim.R
+  #' Sample by age by year non-lethally
+  #'
+  #' @param population data.table of population from simulation
+  #' @param samp_size the matrix of the sample size each year at age
+  #' @param sample_years vector of years from the sim to sample from39
+  #' @param max_age the max age of individuals in the population
+  #' @export
+  sample_age_by_year <- function(population,samp_size,sample_years,max_age){
+      samps = list()
+      for(y in sample_years){
+          y2 = y-min(sample_years)+1
+          setkey(population,alive,cur_year)
+          allive = population[.(TRUE,y)]
+          allive[, `:=`(age,cur_year-birth_year)]
+          ages = list()
+          setkey(allive,age)
+          for(a in 1:max_age){
+              ages[[a]] = allive[.(a)]
+          }
+          sages = list()
+          for(a in 1:max_age){
+              sages[[a]] = sample(1:nrow(ages[[a]]),samp_size[a,y2])
+          }
+          ret = list()
+          for(a in 1:max_age){
+              ret[[a]] = ages[[a]][sages[[a]],]
+          }
+          samps[[y2]] = ret
+      }
+      samps
+  }
+  
+#+end_src
+
+      
+** simhelpers.R
+
+   ~simhelpers~ contains a bunch of functions that are kind of helpful that used to live in my sim script.
+
+*** make_les
+
+    ~make_les~ creates a simple Leslie matrix for an age structured population from a supplied average fecundity
+    vector and a survival probability at age vector (the probability of surviving from age i to i+1). This
+    takes the form of a matrix with the fecundity vector as the first row and the survival vector being the
+    first off-diagonal below the diagonal. 
+   
+   #+begin_src R :eval never :tangle ./R/simhelpers.R
+     #' Make Leslie Matrix
+     #'
+     #' Creates a simple Leslie matrix from fecundity and survival vectors
+     #' @param fecun the fecundity vector
+     #' @param surv the survival vector
+     #'
+     #' @export
+     make_les <- function(fecun,surv){
+         Les = matrix(0,nrow=length(fecun),ncol=length(fecun))
+         Les[1,] = fecun
+         for(i in 1:length(surv)){
+             Les[i+1,i] = surv[i]
+         }
+         Les
+     }     
+   #+end_src
+
+*** get_growth
+
+    Finds the deterministic growth rate from the Leslie matrix. This is defined as the largest Eigenvalue of the
+    Lesilie matrix.
+
+    #+begin_src R :eval never :tangle ./R/simhelpers.R
+      #' Find deterministic growth rate of Leslie Matrix
+      #'
+      #' @param Les the Leslie matrix to find the growth rate of
+      #'
+      #' @export
+      get_growth <- function(Les){
+          ev <- eigen(Les,only.values=TRUE)$values
+          Re(ev[1])
+      }
+    #+end_src
+
+*** fecund_inv_fun
+
+    A simple fecundity by age function based on a single parameter ~fpar~.
+
+    #+begin_src R :eval never :tangle ./R/simhelpers.R
+      #' Simple fecundity at age function
+      #'
+      #' @param age the age of the individual
+      #' @param fpar the fecundity parameter
+      #' @export
+      fecund_inv_fun <- function(age,fpar){
+          exp(fpar)*age^2
+      }
+    #+end_src
+
+*** surv_inv_function
+
+    This function keeps survival within the range specified by ~a~ and ~b~.
+
+    #+begin_src R :eval never :tangle ./R/simhelpers.R
+      #' Keeps survival within a specified range
+      #'
+      #' @param y a value
+      #' @param a the lower part of the range
+      #' @param b the upper part of the range
+      #' @export
+      surv_inv_fun <- function(y,a,b){
+          x = a+(b-a)*plogis(y)
+          x
+      }
+    #+end_src
+
+*** get_pars_with_target
+
+    This function is used to find the missing survival parameter value needed to hit the desired target
+    growth rate for the simulation Leslie matrix. This version is limited to the case of the simulations
+    described in the section "Simulation Description". This is done by optimizing for that final parameter once
+    the others have been randomly generated.
+
+    #+begin_src R :eval never :tangle ./R/simhelpers.R
+      #' Find missing parameter for target growth rate
+      #'
+      #' @param target the target deterministic growth rate to hit
+      #' @export
+      get_pars_with_target <- function(target){
+          pars = c(runif(1,-2,2))
+          fpar = runif(1,-1,-.5)
+          y = runif(1,0.1,0.4)
+          
+          optomax = function(pars){
+              fecun = fecund_inv_fun(1:3,fpar)
+              survt = surv_inv_fun(pars[1],0.1,0.9)
+              surv = c(survt,y)
+              Les <- make_les(fecun,surv)
+              gw = get_growth(Les)
+              abs(target-gw)
+          }
+          opt = optim(pars,optomax,method="Brent",lower=-5,upper=5)
+          print(opt)
+          
+          fex = fecund_inv_fun(1:3,fpar)
+          ##surv = c(surv_inv_fun(opt$root,0.1,0.7),y)
+          surv = c(surv_inv_fun(opt$par,0.1,0.9),y)
+          Les = make_les(fex,surv)
+          gw = get_growth(Les)
+          
+          ret = list(growth_rate=gw,fec=fex,surv=surv,fpar=fpar)
+          ret
+    
+      }
+#+end_src
+
+*** n_at_age
+
+    Given a population from the return the numbers at age in the population. This is useful
+    for diganosing the simulation.
+
+    #+begin_src R :eval never :tangle ./R/simhelpers.R
+      #' Get numbers at age matrix from population
+      #'
+      #' @param pop the population to get numbers at age for
+      #' @export
+      n_at_age <- function(pop){
+          population = pop$population[pop$population$alive == TRUE]
+          population$age = population$cur_year - population$birth_year
+          table(population$cur_year,population$age)
+      }
+      
+    #+end_src
+
+
+
+
+
+* Simple Simulation
+
+This section contains the scripts and models for running the simplifed simulation section of the analysis.
+
+#+begin_src C++ :tangle ./simplesim/models/CMP.cpp :exports none :mkdirp yes
+  #include <TMB.hpp>
+
+//used to easily get pmf from CMP dist with given mean and overdispersion.
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+    PARAMETER(mean);
+    PARAMETER(nu);
+    DATA_INTEGER(n);
+
+    vector<Type> sims(n);
+    SIMULATE{
+      sims = rcompois2(n,mean,nu);
+      REPORT(sims);
+    }
+
+    vector<Type> compPDF(n);
+    for(int i = 0; i < n; ++i){
+      compPDF(i) = dcompois2(Type(i),mean,nu);
+    }
+    REPORT(compPDF);
+
+    return 0;
+  }
+
+#+end_src
+
+#+begin_src C++ :tangle ./simplesim/models/mprobsim.cpp
+  #include <TMB.hpp>
+
+    template<class Type>
+    Type smooth_choose(Type n, Type k,bool give_log){
+      Type leftover = n-k;
+      Type ret = lfactorial(n) - (lfactorial(leftover)+lfactorial(k));
+
+      if(give_log == false){
+	ret = exp(ret);
+      }
+
+      return ret;
+    }
+
+
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+
+      PARAMETER(log_V_A);
+      PARAMETER(log_N);
+      PARAMETER(log_E_A);
+  
+      Type V_A = exp(log_V_A);
+      Type N = exp(log_N);
+      Type E_A = exp(log_E_A);
+  
+      DATA_IMATRIX(datan);
+      Type nll = 0.0;
+
+      vector<Type> exppairs(datan.rows());
+      for(int i = 0; i < datan.rows(); ++i){
+	Type n = Type(datan(i,0));
+	Type obs = Type(datan(i,4));
+	Type pairs = smooth_choose(n,Type(2.0),false);
+	Type expp = 1/N*(1+(V_A-E_A)/pow(E_A,2))*pairs;
+	exppairs(i) = expp;
+	nll -= dpois(obs,expp,true);
+      }
+
+      REPORT(exppairs);
+      ADREPORT(exppairs);
+      REPORT(V_A);
+      REPORT(N);
+      REPORT(E_A);
+      return nll;
+
+  }
+
+
+#+end_src
+
+
+#+begin_src C++ :tangle ./simplesim/models/mprobsimAdj.cpp
+#include <TMB.hpp>
+
+  template<class Type>
+  Type smooth_choose(Type n, Type k,bool give_log){
+    Type leftover = n-k;
+    Type ret = lfactorial(n) - (lfactorial(leftover)+lfactorial(k));
+
+    if(give_log == false){
+      ret = exp(ret);
+    }
+
+    return ret;
+  }
+
+
+template<class Type>
+Type objective_function<Type>::operator() ()
+{
+
+    PARAMETER(log_V_A);
+    PARAMETER(log_N);
+    PARAMETER(log_E_A);
+  
+    Type V_A = exp(log_V_A);
+    Type N = exp(log_N);
+    Type E_A = exp(log_E_A);
+  
+    DATA_IMATRIX(datan);
+    Type nll = 0.0;
+
+    vector<Type> exppairs(datan.rows());
+    for(int i = 0; i < datan.rows(); ++i){
+      Type n = Type(datan(i,0));
+      Type obs = Type(datan(i,4));
+      Type pairs = smooth_choose(n,Type(2.0),false);
+      Type expp = 1/N*(1+1/V_A)*pairs;
+      exppairs(i) = expp;
+      nll -= dpois(obs,expp,true);
+    }
+
+    REPORT(exppairs);
+    ADREPORT(exppairs);
+    REPORT(V_A);
+    REPORT(N);
+    REPORT(E_A);
+    return nll;
+
+}
+
+
+#+end_src
+
+
+#+begin_src C++ :tangle ./simplesim/models/CMPSim.cpp :exports none
+  #include <TMB.hpp>
+
+//used to easily get pmf from CMP dist with given mean and overdispersion.
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+    PARAMETER(mean);
+    PARAMETER(nu);
+    DATA_INTEGER(n);
+
+    vector<Type> sims(n);
+    SIMULATE{
+      sims = rcompois2(n,mean,nu);
+      REPORT(sims);
+    }
+
+    return 0;
+  }
+
+#+end_src
+
+#+begin_src C++ :tangle ./simplesim/models/EXPOG.cpp :exports none
+  #include <TMB.hpp>
+
+  template<class Type>
+  Type smooth_choose(Type n, Type k,bool give_log){
+    Type leftover = n-k;
+    Type ret = lfactorial(n) - (lfactorial(leftover)+lfactorial(k));
+
+    if(give_log == false){
+      ret = exp(ret);
+    }
+
+    return ret;
+  }
+
+  template<class Type>
+  Type smooth_dhyper(Type x, Type m,Type n, Type k, bool give_log){
+    Type tot = m+n;
+    Type ret = (smooth_choose(m,x,true)+smooth_choose(n,k-x,true)) - smooth_choose(tot,k,true);
+    if(give_log == false){
+      ret = exp(ret);
+    }
+    return ret;
+  }
+
+  template<class Type>
+  Type exp_pairs_given_nb(Type n,Type N,Type lambda,Type theta){
+    vector<Type> densnb(2001);
+    vector<Type> fecprop(2001);
+
+    Type nb_var = lambda+pow(lambda,2)/theta;
+
+    for(int i = 0; i < densnb.size(); ++i){
+      densnb(i) = dnbinom2(Type(i),lambda,nb_var);
+      fecprop(i) = N*densnb(i);
+    }
+
+    Type totballs = N*lambda;
+
+    vector<Type> exppairs(2001);
+    Type exp_res = 0.0;
+    for(int x = 0; x < densnb.size(); ++x){
+      exp_res += fecprop(x)*((n*x)/(totballs)-smooth_dhyper(Type(1.0),Type(x),totballs-x,n,false));
+    }
+    return exp_res;
+  }
+
+
+
+  template<class Type>
+  Type objective_function<Type>::operator() ()
+  {
+    PARAMETER(log_theta);
+    PARAMETER(log_N);
+    PARAMETER(log_lambda);
+  
+    Type theta = exp(log_theta);
+    Type N = exp(log_N);
+    Type lambda = exp(log_lambda);
+  
+    DATA_IMATRIX(datan);
+    Type nll = 0.0;
+
+    vector<Type> exppairs(datan.rows());
+    for(int i = 0; i < datan.rows(); ++i){
+      Type n = Type(datan(i,0));
+      Type obs = Type(datan(i,4));
+      Type expp = exp_pairs_given_nb(n,N,lambda,theta);
+      exppairs(i) = expp;
+      nll -= dpois(obs,expp,true);
+    }
+
+    REPORT(exppairs);
+    ADREPORT(exppairs);
+    return nll;
+
+
+  }
+#+end_src
+
+#+begin_src R :eval never :exports none :tangle ./simplesim/script.R
+    library(TMB)
+    compile("./simplesim/models/CMP.cpp")
+    dyn.load(dynlib("./simplesim/models/CMP"))
+    compile("./simplesim/models/CMPSim.cpp")
+    dyn.load(dynlib("./simplesim/models/CMPSim"))
+  compile("./simplesim/models/mprobsim.cpp")
+  dyn.load(dynlib("./simplesim/models/mprobsim"))
+  compile("./simplesim/models/mprobsimAdj.cpp")
+  dyn.load(dynlib("./simplesim/models/mprobsimAdj"))
+
+
+  library(extraDistr)
+
+    data = list()
+    data$n = 5000
+
+    parm = list()
+    parm$mean = 5
+    parm$nu = 1
+
+  cmp = MakeADFun(data,parm,type="Fun",DLL="CMPSim")
+  cmpNS = MakeADFun(data,parm,type="Fun",DLL="CMP")
+
+    ball_sim_diffCMP <- function(nn,n1,n2,meanV,nu){
+      onesim <- replicate(nn,{
+	balls1 = cmp$simulate(c(meanV,nu))$sims
+	balls2 = cmp$simulate(c(meanV,nu))$sims
+	draw1 = rmvhyper(1,balls1,n1)
+	draw2 = rmvhyper(1,balls2,n2)
+	sum(draw1*draw2)
+      })
+      onesim
+    }
+
+    ball_sim_sameCMP <- function(nn,n,meanV,nu){
+      res = replicate(nn,{
+	balls = cmp$simulate(c(meanV,nu))$sims
+	draws = rmvhyper(1,balls,n)
+	pairs = rowSums(choose(draws,2))
+	pairs
+      })
+      res
+    }
+
+    ##62*125 is same as choose(125,2)
+
+    exp_diff <- function(pairs,num_par){
+      pairs*(1/num_par)
+    }
+
+    exp_same_given_CMP <- function(n,N,meanV,nu){
+      densCMP = N*cmpNS$report(c(meanV,nu))$compPDF
+      totballs = N*meanV
+      exppairs =  lapply(0:4999,function(x){
+	pairs = choose(0:x,2)
+	sum(pairs*dhyper(0:x,x,max(0,totballs-x),n))
+      })
+      exppairsV = do.call(rbind,exppairs)
+      sum(densCMP*exppairsV)
+    }
+
+
+
+
+
+    sim_nus = c(exp(seq(-5,5,by=0.1)))
+
+    exp_CMPs = sapply(sim_nus,function(x){
+      exp_same_given_CMP(125,5000,5,x)
+    })
+
+    same_case = list()
+    diff_case = list()
+    for(i in 1:length(sim_nus)){
+      print(i)
+      same_case[[i]] = mean(ball_sim_sameCMP(1000,125,5,sim_nus[i]))
+      diff_case[[i]] = mean(ball_sim_diffCMP(1000,62,125,5,sim_nus[i]))
+    }
+
+    scc =  do.call(rbind,same_case)
+    dcc = do.call(rbind,diff_case)
+
+    df = data.frame(nus=log(sim_nus),same_case_theo=exp_CMPs,diff_case_theo=exp_diff(62*125,5000),same_case=scc,diff_case=dcc)
+    saveRDS(df,file="./simplesim/sameVsDiff.rds")
+
+    exp_diff(62*125,5000)
+
+    dum_fix <- function(x){
+      ifelse(x == 1,0,x)
+    }
+
+  library(extraDistr)
+
+    od_rpois <- function(n,lambda,theta){
+      E <- rgamma(n,theta)/theta
+      Y <- rpois(n,lambda*E)
+    }
+
+    od_ball_sim_same <- function(nn,n,N,lambda,theta){
+      res = replicate(nn,{
+	balls = od_rpois(N,lambda,theta)
+	draws = rmvhyper(1,balls,n)
+	pairs =colSums(apply(draws,1,dum_fix))
+	pairs
+      })
+      res
+    }
+
+
+    od_ball_sim_samePairs <- function(nn,n,N,lambda,theta){
+      res = replicate(nn,{
+	balls = od_rpois(N,lambda,theta)
+	draws = rmvhyper(1,balls,n)
+	pairs = colSums(apply(draws,1,function(x){choose(x,2)}))
+	pairs
+      })
+      res
+    }
+
+
+    thetas = c(0.1,0.25,0.5,0.75,1,1.25,2,5)
+    set.seed(42)
+    superDats = replicate(1000,{dats = lapply(thetas,function(x){
+      n = sample(100:200,10,TRUE)
+      dat = data.frame(n=n)
+      dat$N = 5000
+      dat$theta = x
+      dat$lambda = 10
+      dat$obs = apply(dat,1,function(x){
+	od_ball_sim_same(1,x[1],x[2],x[4],x[3])})
+      dat
+    })})
+
+   superDatsPairs = replicate(1000,{dats = lapply(thetas,function(x){
+      n = sample(100:200,10,TRUE)
+      dat = data.frame(n=n)
+      dat$N = 5000
+      dat$theta = x
+      dat$lambda = 10
+      dat$obs = apply(dat,1,function(x){
+	od_ball_sim_samePairs(1,x[1],x[2],x[4],x[3])})
+      dat
+    })})
+
+
+
+    compile("./simplesim/models/EXPOG.cpp")
+    dyn.load(dynlib("./simplesim/models/EXPOG"))
+
+
+    resultsTMB <- lapply(superDats,function(x){
+      parmI = list()
+      parmI$log_theta = log(1)
+      parmI$log_N = log(5000)
+      parmI$log_lambda = log(10)
+      data = list()
+      data$datan = as.matrix(x)
+      mapp = list(log_N = as.factor(c(NA)),log_lambda= as.factor(c(NA)))
+      obj = TMB::MakeADFun(data=data,parameters = parmI,map=mapp,DLL="EXPOG")
+      opt = optim(obj$par,obj$fn,obj$gr,method="Brent",lower=-10,upper=10)
+      ret = c(est=exp(opt$par),theta=unique(x$theta))
+      ret
+    })
+
+  resultsTMBMP <- lapply(superDatsPairs,function(x){
+    parmMP = list()
+    parmMP$log_V_A = log(1)
+    parmMP$log_N = log(5000)
+    parmMP$log_E_A = log(10)
+    data = list()
+    data$datan = as.matrix(x)
+    mapp = list(log_N = as.factor(c(NA)),log_E_A= as.factor(c(NA)))
+    obj = TMB::MakeADFun(data=data,parameters = parmMP,method="Brent",lower=-10,upper=10,map=mapp,DLL="mprobsim")
+    opt = optim(obj$par,obj$fn,obj$gr)
+    lam = unique(x$lambda)
+    tvar = lam+lam^2/unique(x$theta)
+    ret = c(V_A=exp(opt$par),tV_A=tvar)
+  })
+
+  resultsTMBMPFreeN <- lapply(superDatsPairs,function(x){
+    parmMP = list()
+    parmMP$log_V_A = log(1)
+    parmMP$log_N = log(5000)
+    parmMP$log_E_A = log(10)
+    data = list()
+    data$datan = as.matrix(x)
+    mapp = list(log_N = as.factor(c(NA)),log_E_A= as.factor(c(NA)))
+    obj = TMB::MakeADFun(data=data,parameters = parmMP,map=mapp,DLL="mprobsim")
+    opt = optim(obj$par,obj$fn,obj$gr)
+    rep = obj$report()
+    lam = unique(x$lambda)
+    tvar = lam+lam^2/unique(x$theta)
+    ret = c(V_A=rep$V_A,N=rep$N,E_A=rep$E_A,tV_A=tvar)
+  })
+
+
+  dfsMP = as.data.frame(do.call(rbind,resultsTMBMP)) |>
+    group_by(tV_A) |>
+    summarise(quantile = scales::percent(c(0.05, 0.5, 0.95)),
+	      thetahat = quantile(V_A.log_V_A, c(0.05, 0.5, 0.95)))
+
+
+    dfs3MP =  spread(dfsMP,key="quantile",value="thetahat")
+
+
+    dfs =  do.call(rbind,resultsTMB)
+    library(tidyverse)
+    dfs2 = as.data.frame(dfs) |>
+      group_by(theta) |>
+      summarise(quantile = scales::percent(c(0.05, 0.5, 0.95)),
+		thetahat = quantile(est, c(0.05, 0.5, 0.95)))
+    saveRDS(dfs,file="./simplesim/thetaTest.rds")
+
+    dfs3 =  spread(dfs2,key="quantile",value="thetahat")
+
+    resultsTMBFreeN <- lapply(superDats,function(x){
+      parmI = list()
+      parmI$log_theta = log(1)
+      parmI$log_N = log(2000)
+      parmI$log_lambda = log(10)
+      ##parmI$log_theta_sum = log(1)
+      data = list()
+      data$datan = as.matrix(x)
+      mapp = list(log_N = as.factor(c(1)),log_lambda= as.factor(c(NA)))
+      obj = TMB::MakeADFun(data=data,parameters = parmI,map=mapp,DLL="EXPOG")
+      opt = optim(obj$par,obj$fn,obj$gr)
+      ret = c(est=exp(opt$par),theta=unique(x$theta))
+      ret
+    })
+
+    dfsFreeN =  do.call(rbind,resultsTMBFreeN)
+    saveRDS(dfsFreeN,file="./simplesim/thetaNtest.rds")
+
+
+
+    dfsFreeN2 = as.data.frame(dfsFreeN) |>
+      group_by(theta) |>
+      summarise(quantile = scales::percent(c(0.05, 0.5, 0.95)),
+		thetahat = quantile(est.log_theta, c(0.05, 0.5, 0.95)),
+		Nhat = quantile(est.log_N,c(0.05,0.5,0.95)))
+
+  library(ggplot2)
+
+  dfsFN3 = as.data.frame(dfsFreeN)
+
+  dfsFN3sp = split(dfsFN3,dfsFN3$theta)
+
+  ggplot(dfsFN3sp[[3]],aes(x=log(dfsFN3sp[[3]]$est.log_theta))) + geom_density()
+
+  densTheta3 = density(log(dfsFN3sp[[3]]$est.log_theta))
+
+
+  densMAX = function(dat){
+    dens = density(dat)
+    wmax = which.max(dens$y)
+    xmax =dens$x[wmax]
+    ret = c(xmax,wmax)
+    ret
+  }
+
+  maxThetas = lapply(dfsFN3sp,function(x){
+    densMAX(log(x$est.log_theta))
+    })
+
+#+end_src
+
+
+* Simulation Scripts 
+
+#+begin_src R
+  library(varCKMR)
+  indiv = readRDS("~/varCKMR3/populations/pop0006.rds")
+
+  ped = make_ped(indiv)
+
+
+  pp = ped$pedigree
+
+  ##Find how many kids each mom and dad had
+  momkids = pp |>
+    group_by(mother) |>
+    summarise(n=n()) |>
+    dplyr::rename(ID=mother)
+
+  dadkids = pp |>
+    group_by(father) |>
+    summarise(n=n()) |>
+    dplyr::rename(ID=father)
+
+  ##Add info about parents birth year
+  momdadkids = data.frame(ID=pp$ID,birth_year=pp$birth_year)
+  momdadkids = left_join(momdadkids,momkids)
+  momdadkids = left_join(momdadkids,dadkids,by="ID")
+  momdadkids[is.na(momdadkids)] = 0
+  momdadkids$kids = momdadkids$n.x+momdadkids$n.y
+
+  ##Find mean and variance number of kids from each cohort
+  summarykids = momdadkids |>
+    group_by(birth_year) |>
+    summarise(var=var(kids),mean=mean(kids))
+
+  ##Get kbar and Vk from simulation (the sim changes life table parameters around year 30 and you need to capture the whole lifespan so stop at 46)
+  estvar = mean(summarykids[35:46,2,TRUE])
+  estmean = mean(summarykids[35:46,3,TRUE])
+
+  ##This is just numbers at age alive in pop 
+  tN = n_at_age(indiv)[,]
+
+
+  ##Essentially Eq. 8+9 in paper
+  condvar <- function(dprob,fec,theta){
+    firstsum = 0.0
+    varsy = fec+fec^2/theta
+    for(i in 1:3){
+      firstsum = firstsum + dprob[i]*sum(varsy[1:i])
+    }
+    secsum = 0.0
+    for(i in 1:3){
+      secsum = secsum + (sum(fec[1:i]))^2*(1-dprob[i])*dprob[i]
+    }
+    lastsum = 0.0
+    for(i in 2:3){
+      for(j in 1:(i-1)){
+	lastsum = lastsum + sum(fec[1:i])*dprob[i]*sum(fec[1:j])*dprob[j]
+      }
+    }
+    tot = firstsum+secsum-2*lastsum
+    tot
+  }
+
+
+  popPar = indiv$popPars  
+
+  dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+  fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+
+  popPar = indiv$popPars  
+
+  dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+  fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+  surv = c(popPar$surv1,popPar$surv2)
+  les = make_les(fec,surv)
+
+  doub_fec = 2*fec
+  thet = popPar$theta
+  varsy = doub_fec+doub_fec^2/thet
+
+
+  growth_rate = max(Re(eigen(les,only.values = TRUE)$values))
+  surv2 = cumprod(c(1,surv,0))
+  surv3 = c(surv,0)
+  fec2 = c(fec,0)
+
+  repro_value <- function(a){
+    lx = surv2[a]
+    vx = 0.0
+    for(i in a:4){
+      vx = vx+growth_rate^(-i-a+1)*surv2[i]/lx*fec2[i]
+    }
+    vx
+  }
+
+  rvs = c(repro_value(1),repro_value(2),repro_value(3))
+  denom = 0.0
+  for(i in 1:3){
+    out = surv2[i]*growth_rate^(-i-1)
+    iner = varsy[i]+surv3[i]*(1-surv3[i])*rvs[i]^2
+    denom = denom + out*iner
+  }
+
+
+  gen_length2 <- function(fec,surv,lambda){
+    ells = cumprod(c(1,surv))
+    nn = length(fec)
+    T = 0.0
+    for(i in 1:nn){
+      T = T + i*lambda^(-i)*ells[i]*fec[i]
+    }
+    T
+  }
+
+  gl2 = gen_length2(fec,surv,popPar$growth_rate)
+  crowNe <- function(N,kbar,Vk,L){
+    nume = (2*N-1)*kbar
+    denom = 2*(1+Vk/kbar)
+    nume*L/denom
+  }
+
+  tN = tN[41:51,]
+  NeEstSim = (4*tN[,1]*(gl2))/(estvar+estmean)
+  cNe = crowNe(tN[,1],estmean,estvar,gl2)
+  cNeNOL = crowNe(tN[,1],estmean,estvar,1)
+  realVk = condvar(dprob,fec*2,popPar$theta)
+  realKbar = sum(cumsum(2*fec)*dprob)
+  cNeReal = crowNe(tN[,1],realKbar,realVk,gl2)
+
+  ## Change in allele freqs
+
+  pop = indiv$population
+
+  A_marks = pop |>
+    select(birth_year,ends_with("_A"))
+  B_marks = pop |>
+    select(birth_year,ends_with("_B"))
+  comb_marks = rbind(A_marks,B_marks,use.names = FALSE)
+  comb_marksD = comb_marks[,-c(1)]-1
+  comb_marks = cbind(comb_marks[,c(1)],comb_marksD)
+  allele_freqs = comb_marks |>
+    group_by(birth_year) |>
+    summarise_all(function(x){sum(x)/length(x)})
+
+  q_change = apply(allele_freqs[,-1],2,function(x){
+    diff(x)})
+
+  var_q = apply(q_change,1,var)
+  notN_e = (allele_freqs[,-1]*(1-allele_freqs[,-1]))/(2*var_q)
+
+  harmonic.mean <- function(x){
+    (sum(x^-1)/length(x))^-1
+  }
+  hmeans = apply(notN_e,1,harmonic.mean)*gl2
+
+
+  rowMeans(notN_e)*gl2
+
+  0.5^2*(1-exp(-1
+#+end_src 
+
+#+begin_src R :session simsClean :exports none :eval never :tangle ./scripts/popGrow2.R :mkdirp yes
+
+    library(varCKMR)
+    library(stringr)
+
+    set.seed(1234)
+    thetas = c(0.1,0.25,0.5,0.75,1,1.25,2,5)
+    growth_rate = c(0.95,1,1.01)
+    pops = expand.grid(theta=thetas,growth_rate=growth_rate)
+
+    sim_seeds = sample(1:100000,nrow(pops))
+
+    sim_df = data.frame(seed=sim_seeds)
+    sim_df$growth_rate = pops$growth_rate
+    sim_df$theta = pops$theta
+    sim_df$fec1 = 0
+    sim_df$fec2 = 0
+    sim_df$fec3 = 0
+    sim_df$surv1 = 0
+    sim_df$surv2 = 0
+
+
+    target = numeric(length(sim_seeds))
+    for(i in 1:nrow(sim_df)){
+      set.seed(sim_df$seed[i])
+      target[i] = sim_df$growth_rate[i]
+      gr = -1
+    while(!isTRUE(all.equal(gr,target[i]))){
+	print(paste0("start",gr))
+	parms = get_pars_with_target(target[i])
+	gr = parms$growth_rate
+	print(gr)
+    }
+      sim_df$growth_rate[i] = parms$growth_rate
+      sim_df$fec1[i] = parms$fec[1]
+      sim_df$fec2[i] = parms$fec[2]
+      sim_df$fec3[i] = parms$fec[3]
+      sim_df$surv1[i] = parms$surv[1]
+      sim_df$surv2[i] = parms$surv[2]
+    }
+
+  if(!dir.exists("../populations/")){
+    dir.create("../populations/")
+  }
+
+  if(!dir.exists("../sims/")){
+    dir.create("../sims/")
+  }
+
+
+
+    write.csv(sim_df,file="../sims/sim_df.csv")
+
+    sim_loc = "../populations/"
+
+    ## Now to actually generate the simulations
+    library(varCKMR)
+    library(tidyverse)
+
+    nyears = 50
+    sampyears = 10
+    growth_rate = 1
+    init_N = c(7000,2500,500)
+    genoM=100
+
+    sim1y = nyears-sampyears
+
+    gts = rep(2,genoM)
+    leper = 1:26
+    genos = unlist(lapply(gts,function(x){leper[seq_len(x)]}))
+    locus = numeric(0)
+    freqs = numeric(0)
+    for(i in 1:genoM){
+      locus = c(locus,rep(i,gts[i]))
+      freqs = c(freqs,c(0.50,0.50))
+    }
+    marks = data.frame(geno=genos,locus=locus,freqs = freqs)
+
+    ##Functions to make functions
+    surv_fun_fun_sex <- function(probs_m,probs_f){
+      surv_fun <- function(age,sex){
+	age = pmin(age,length(probs_m))
+	ret = ifelse(sex == "male",probs_m[age],probs_f[age])
+	ret
+      }    
+      surv_fun
+    }
+
+    mature_fun_fun <- function(probs){
+      mature_fun <- function(age){
+	age = pmin(age+1,length(probs))
+	probs[age]
+      }
+      mature_fun
+    }
+
+    fecun_fun_fun_sex <- function(probs_m,probs_f){
+      fecun_fun <- function(age,sex){
+	age = pmin(age,length(probs_m))
+	ret = ifelse(sex == "male",probs_m[age],probs_f[age])
+	ret
+      }
+      fecun_fun
+    }
+
+    sex_fraction = 0.5
+
+
+    N = data.frame(Age = rep(1:(length(init_N)),2),Sex=c(rep("male",length(init_N)),rep("female",length(init_N))),N=c(floor(init_N*sex_fraction),(init_N-init_N*sex_fraction)))
+
+    for(i in 1:nrow(sim_df)){
+      set.seed(sim_df$seed[i])
+      targ = get_pars_with_target(1)
+      theta = sim_df$theta[i]
+
+      mature_fun <- mature_fun_fun(c(1,1,1,1))
+
+      ageMort = surv_fun_fun_sex(c(targ$surv,0),c(targ$surv,0))
+      ageFec = fecun_fun_fun_sex(targ$fec,targ$fec)
+
+      indiv <- create_founding_pop(N,marks,mature_fun,ageMort,ageFec)
+
+      for(y in 1:(sim1y-10)){
+	indiv <- breed_one_year_od(indiv,y-1,c(theta,theta),sex_fraction)
+      }
+
+      fec = c(sim_df$fec1[i],sim_df$fec2[i],sim_df$fec3[i])
+      surv = c(sim_df$surv1[i],sim_df$surv2[i],0)
+      theta = sim_df$theta[i]
+
+      ageMort2 = surv_fun_fun_sex(surv,surv)
+      ageFec2 = fecun_fun_fun_sex(fec,fec)
+      indiv$fecund_fun = ageFec2
+      indiv$surv_fun = ageMort2
+
+
+      for(y in (sim1y+1-10):nyears){
+	indiv <- breed_one_year_od(indiv,y-1,c(theta,theta),sex_fraction)
+      }
+
+      indiv$popPars = sim_df[i,]
+
+      saveRDS(indiv,file=paste0(sim_loc,"pop",str_pad(i,4,pad="0"),".rds"))
+    }
+
+
+#+end_src
+
+#+begin_src R :session simsClean :exports none :eval never :tangle ./scripts/simGrowSetup.R
+  library(tidyverse)
+  library(stringr)
+  library(varCKMR)
+
+  sim_df = read.csv("../sims/sim_df.csv")
+  sim_loc = "../sims/"
+  files = list.files("../populations/","*.rds")
+  gfiles = gsub(".rds","",files)
+  for(i in 1:length(gfiles)){
+  dir.create(paste0(sim_loc,gfiles)[i])
+  }
+
+  library(reshape)
+  reps = data.frame(rep=1:1000)
+
+  popPar = list()
+  for(i in 1:length(files)){
+    pop = readRDS(paste0("../populations/",files[i]))
+    popPar[[i]] = pop$popPar
+    popPar[[i]]$foldname = paste0("../sims/",gfiles[i])
+  }
+  popPar = do.call(rbind,popPar)
+  popPar$X = 1:nrow(popPar)
+
+  rep_df = expand.grid.df(popPar,reps)    
+  rep_df = split(rep_df,rep_df$X)
+  set.seed(46)
+  rep_df = lapply(rep_df,function(x){
+    x$seed = sample(1:1000000,nrow(x))
+    x})
+
+  nyears = 50
+  sampyears = 10
+  sim1y = nyears-sampyears
+
+  rep_df1 = rep_df[1:4]
+  rep_df2 = rep_df[5:8]
+  rep_df3 = rep_df[9:12]
+  rep_df4 = rep_df[13:16]
+  rep_df5 = rep_df[17:21]
+  rep_df6 = rep_df[22:24]
+  saveRDS(rep_df1,file="../sims/rep_df1.rds")
+  saveRDS(rep_df2,file="../sims/rep_df2.rds")
+  saveRDS(rep_df3,file="../sims/rep_df3.rds")
+  saveRDS(rep_df4,file="../sims/rep_df4.rds")
+  saveRDS(rep_df5,file="../sims/rep_df5.rds")
+  saveRDS(rep_df6,file="../sims/rep_df6.rds")
+#+end_src
+
+#+NAME: simGrow
+#+begin_src R :exports code
+ library(tidyverse)
+  library(stringr)
+  library(varCKMR)
+
+  sim_df = read.csv("../sims2/sim_df.csv")
+  sim_loc = "../"
+
+  rep_df = readRDS(repdf)
+
+  nyears = 50
+  sampyears = 10
+  sim1y = nyears-sampyears
+
+
+  for(k in 1:length(rep_df)){
+
+    indiv = readRDS(paste0(sim_loc,"populations/","pop",str_pad(rep_df[[k]]$X[1],4,pad="0"),".rds"))
+ped = make_ped(indiv)
+pp = ped$pedigree
+
+    for(rr in 1:nrow(rep_df[[k]])){
+      print(rr)
+      set.seed(rep_df[[k]]$seed[rr])
+      library(tidyverse)
+
+      nyears = 50
+      sim_years = 41:50
+
+      tN = t(n_at_age(indiv)[sim_years,])
+
+      ##Get a sample some multiple of true size
+      fun_fun = function(multiplier){
+	fun = function(y){
+	  multiplier*sqrt(y)
+	}
+	fun
+      }
+
+      fun = fun_fun(2.5)
+
+      samp = rough_sample_size(tN,fun)
+      samps = sample_age_by_year(indiv$population,samp,sim_years,3)
+
+      library(tidyverse)
+      library(reshape)
+
+      ##Try and find POPs and HSPs
+      sampC = do.call(rbind,unlist(samps,FALSE))
+      sampC1 = sampC[,1:8]
+      sampC2 = sampC[,1:8]
+
+      sampCDF1 = sampC |>
+	group_by(birth_year,cur_year) |>
+	summarise(n_samp=n())
+
+      sampCDF2 = sampCDF1
+      names(sampCDF1) = paste0(names(sampCDF1),".1")
+      names(sampCDF2) = paste0(names(sampCDF2),".2")
+      sampCDFF = expand.grid.df(sampCDF1,sampCDF2)
+
+      sampCDFF = sampCDFF |>
+	filter(birth_year.1 > birth_year.2) |>
+	filter(birth_year.1 - birth_year.2 <= 3) |>
+	mutate(n_comp=n_samp.1*n_samp.2) 
+
+      ##Find POPs quicker
+      fath = data.frame(ID=sampC$father,row=1:nrow(sampC))
+      moth = data.frame(ID=sampC$mother,row=1:nrow(sampC))
+      ID = data.frame(ID=sampC$ID,col=1:nrow(sampC))
+      FOPsQ = inner_join(fath,ID)
+      MOPsQ = inner_join(moth,ID)
+      FOPs = cbind(sampC[FOPsQ[,"row"],c("birth_year","cur_year")],sampC[FOPsQ[,"col"],c("birth_year","cur_year")])
+      MOPs = cbind(sampC[MOPsQ[,"row"],c("birth_year","cur_year")],sampC[MOPsQ[,"col"],c("birth_year","cur_year")])
+      POPsC = rbind(FOPs,MOPs) 
+      names(POPsC) = c("birth_year.1","cur_year.1","birth_year.2","cur_year.2")
+      POPsC = POPsC |>
+	group_by(birth_year.1,cur_year.1,birth_year.2,cur_year.2) |>
+	summarize(POPs=n())
+      POPsC2 = POPsC
+
+      POPs = left_join(sampCDFF,POPsC)
+      POPs$POPs[is.na(POPs$POPs)] = 0
+      POPs = filter(POPs,birth_year.1 > (sim1y -1))
+      POPs = select(POPs,birth_year.1,cur_year.1,birth_year.2,cur_year.2,n_comp,POPs)
+      POPs2 = POPs
+
+      ##Find Sibs quicker
+      sampCDFF2A = expand.grid.df(sampCDF1,sampCDF2)
+      sampCDFF2 = sampCDFF2A |>
+	filter(birth_year.1 >= birth_year.2) |>
+	filter(birth_year.1 - birth_year.2 <= 2) |>
+	##Doesn't work for SC
+	mutate(n_comp=ifelse(birth_year.1 == birth_year.2 & cur_year.1 == cur_year.2,choose(n_samp.1,2),n_samp.1*n_samp.2)) |>
+	select(birth_year.1,cur_year.1,birth_year.2,cur_year.2,n_comp)
+
+      bbs1 = data.frame(birth_year=sampC$birth_year,row=1:nrow(sampC))
+      bbs2 = data.frame(birth_year=sampC$birth_year,col=1:nrow(sampC))
+      Births = inner_join(bbs1,bbs2) |>
+	filter(row !=col)
+
+      BirthsSC = cbind(sampC[Births[,"row"],c("birth_year","cur_year","ID","mother","father")],sampC[Births[,"col"],c("birth_year","cur_year","ID","mother","father")])
+      names(BirthsSC) = c("birth_year.1","cur_year.1","ID.1","mother.1","father.1","birth_year.2","cur_year.2","ID.2","mother.2","father.2")
+      BirthsSC = BirthsSC |>
+	filter(ID.1 != ID.2) |>
+	filter(birth_year.1 >= birth_year.2) |>
+	distinct()
+
+      sampCDFF3 = BirthsSC |>
+	group_by(birth_year.1,cur_year.1,birth_year.2,cur_year.2) |>
+	summarize(n_comp=n())
+
+      fath1 = data.frame(ID=sampC$father,row=1:nrow(sampC))
+      moth1 = data.frame(ID=sampC$mother,row=1:nrow(sampC))
+      fath2 = data.frame(ID=sampC$father,col=1:nrow(sampC))
+      moth2 = data.frame(ID=sampC$mother,col=1:nrow(sampC))
+
+
+      FSPsArr = inner_join(fath1,fath2) |>
+	filter(row != col)
+      MSPsArr = inner_join(moth1,moth2) |>
+	filter(row != col)
+      FSPs = cbind(sampC[FSPsArr[,"row"],c("birth_year","cur_year","ID","mother","father")],sampC[FSPsArr[,"col"],c("birth_year","cur_year","ID","mother","father")])
+      MSPs = cbind(sampC[MSPsArr[,"row"],c("birth_year","cur_year","ID","mother","father")],sampC[MSPsArr[,"col"],c("birth_year","cur_year","ID","mother","father")])
+      SPsA = rbind(FSPs,MSPs)
+      names(SPsA) = c("birth_year.1","cur_year.1","ID.1","mother.1","father.1","birth_year.2","cur_year.2","ID.2","mother.2","father.2")
+      SPs = SPsA |>
+	filter(ID.1 != ID.2) |>
+	filter(birth_year.1 >= birth_year.2) |>
+	distinct()
+
+      SPsC = SPs |>
+	group_by(birth_year.1,cur_year.1,birth_year.2,cur_year.2) |>
+	summarize(Sibs=n())
+
+
+      SPsBP = SPsA |>
+	filter(ID.1 != ID.2) |>
+	filter(birth_year.1 == birth_year.2) |>
+	distinct()
+
+      SPsBP$tups = apply(SPsBP, 1, function(x) {
+	paste(sort(c(x[3], x[8])), collapse = "|")
+      })
+
+      SPsBP = SPsBP |>
+	distinct(tups,.keep_all=TRUE) |>
+	group_by(birth_year.1) |>
+	summarise(nsib = n()) |>
+	select(birth_year=birth_year.1,nsib)
+
+
+      SibsC = left_join(sampCDFF2,SPsC)
+      SibsC$Sibs[is.na(SibsC$Sibs)] = 0
+      SibsC = filter(SibsC,birth_year.1 > (sim1y -1))
+      SibsC = filter(SibsC,birth_year.2 > (sim1y -1))
+
+      SibsXC = SibsC |>
+	filter(birth_year.1 != birth_year.2)
+
+
+      SibsXC2 = SibsXC
+##      SibsSCP2 = SibsSCP
+
+      ##Same Cohort, using clusters
+      SibtyComps = sampC |>
+	distinct(ID,.keep_all=TRUE) |>
+	group_by(birth_year) |>
+	summarize(n_draws=n()*2)
+
+      SibtySCM = sampC |>
+	distinct(ID,.keep_all=TRUE) |>
+	group_by(birth_year,mother) |>
+	summarize(n_MSB=n()) |>
+	filter(n_MSB > 1) |>
+	group_by(birth_year) |>
+	summarise(n_MSB=sum(n_MSB))
+
+      SibtySCF = sampC |>
+	distinct(ID,.keep_all=TRUE) |> 
+	group_by(birth_year,father) |>
+	summarize(n_FSB=n()) |>
+	filter(n_FSB > 1) |>
+	group_by(birth_year) |>
+	summarize(n_FSB=sum(n_FSB))
+
+      SibtySC = left_join(SibtySCM,SibtySCF)
+      SibtySC = left_join(SibtySC,SibtyComps)
+      SibsSC = SibtySC |>
+	mutate(n_SB = n_MSB+n_FSB) |>
+	select(birth_year,n_SB,n_draws) |>
+	filter(birth_year > (sim1y -1))
+
+
+sNcomp = sampC1 |>
+    group_by(birth_year) |>
+    summarize(ncomp=n()) |>
+    mutate(ncomp=choose(ncomp,2))
+
+  SCPgorp2 = sNcomp |>
+    left_join(SPsBP) |>
+    mutate(aprob = nsib/ncomp)
+
+  SCP = SCPgorp2 |>
+    filter(birth_year >= sim1y) |>
+    mutate(birth_year = birth_year-sim1y) |>
+    select(birth_year,nsib,ncomp)
+
+
+
+      ##Correct bounds
+      SibsSC[,1] = SibsSC[,1]-sim1y
+      SibsXC[,1:4] = SibsXC[,1:4]-sim1y
+      POPs[,1:4] = POPs[,1:4]-sim1y
+
+      data = list()
+      data$Y = 10+1
+      data$A = 3
+      data$POPs = as.matrix(POPs)
+      data$SIBsXC = as.matrix(SibsXC)
+      data$SIBsSC = as.matrix(SibsSC)
+      data$SIBsSCP = as.matrix(SCP)
+
+
+      parm = list()
+      parm$log_init_tot_N = log(3000)
+      parm$log_M = log(c(0.2,0.2,0))
+      parm$log_fecundity = log(c(1,1,1))
+      parm$log_theta = log(1)
+
+
+
+
+      ret = list(data=data,parm=parm)
+      saveRDS(ret,file=paste0(rep_df[[k]]$foldname[1],"/","clean",str_pad(rr,4,pad="0"),".rds"))
+    }
+  }
+
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow1.R :var repdf="../sims/rep_df1.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow2.R :var repdf="../sims/rep_df2.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow3.R :var repdf="../sims/rep_df3.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow4.R :var repdf="../sims/rep_df4.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow5.R :var repdf="../sims/rep_df5.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simGrow6.R :var repdf="../sims/rep_df6.rds" :noweb yes
+<<simGrow>>
+#+end_src
+
+#+NAME:simFit
+#+begin_src R :exports code :eval never
+    library(TMB)
+    library(tidyverse)
+    library(stringr)
+    library(varCKMR)
+
+    if(!file.exists("../models/ssmodelAdj.o")){
+      compile("../models/ssmodelAdj.cpp")
+    }
+    if(!file.exists("../models/ssmodelNoSC.o")){
+      compile("../models/ssmodelNoSC.cpp")
+    }
+
+
+
+    dyn.load(dynlib("../models/ssmodelAdj"))
+    dyn.load(dynlib("../models/ssmodelNoSC"))
+
+
+    rep_df = readRDS(repdf)
+
+
+	for(k in 1:length(rep_df)){
+
+	  files = list.files(paste0(rep_df[[k]]$foldname[1]),pattern = "*.rds",full.names = TRUE)
+	  popbit =  regexec("pop[0-9][0-9][0-9][0-9]",files)
+	  mlength = sapply(popbit,function(x){attributes(x)$match.length})
+	  popID = unique(do.call(substring,list(text=files,first=popbit,last=unlist(popbit)+mlength-1)))
+
+	  for(rr in 1:length(files)){
+	    print(rr)
+	    stuff = readRDS(files[rr])
+
+	    dat = stuff$data
+	    dat$skipsame = 0
+	    parm = stuff$parm
+	    parm$log_init_tot_N = 10
+
+	  mapp2 = list(log_M=as.factor(c(1,2,NA)),log_init_tot_N=as.factor(c(1)),
+		       log_fecundity=as.factor(c(1,2,3)),log_theta=as.factor(c(1)))
+
+
+	  ##No SC cohort
+	  datSC = stuff$data
+	  datSC$SIBsSC = NULL
+	  parmSC = parm
+	  parmSC$log_theta = NULL
+	  mapp2SC = mapp2
+	  mapp2SC$log_theta = NULL
+	  objSC = MakeADFun(datSC,parmSC,map = mapp2SC, DLL="ssmodelNoSC")
+	  optSC = nlminb(objSC$par,objSC$fn,objSC$gr,control=list(iter.max=5000))
+	  reportSC = objSC$report()
+	  sdrSC = sdreport(objSC)
+	    ssdrSC = summary(sdrSC)
+
+	    ##MB version
+	    datMB = stuff$data
+	    datMB$skipsame = 0
+	    parmMB = stuff$parm
+
+	    objMB = MakeADFun(datMB,parmMB,map=mapp2,DLL="ssmodelAdj")
+	    optMB = nlminb(objMB$par,objMB$fn,objMB$gr,control=list(iter.max=5000))
+	    reportMB = objMB$report()
+	    sdrMB = sdreport(objMB)
+	    ssdrMB = summary(sdrMB)
+
+
+
+
+	  ##Find variance 
+	  indiv = readRDS(paste0("../populations/",popID,".rds"))
+	  ped = make_ped(indiv)
+
+
+	    pp = ped$pedigree
+
+	    momkids = pp |>
+	      group_by(mother) |>
+	      summarise(n=n()) |>
+	      dplyr::rename(ID=mother)
+
+	    dadkids = pp |>
+	      group_by(father) |>
+	      summarise(n=n()) |>
+	      dplyr::rename(ID=father)
+
+	    zorp = data.frame(ID=pp$ID,birth_year=pp$birth_year)
+	    zorp = left_join(zorp,momkids)
+	    zorp = left_join(zorp,dadkids,by="ID")
+	    zorp[is.na(zorp)] = 0
+	    zorp$kids = zorp$n.x+zorp$n.y
+
+	    zack = zorp |>
+	      group_by(birth_year) |>
+	      summarise(var=var(kids),mean=mean(kids))
+
+	      estvar = mean(zack[35:46,2,TRUE])
+	      estmean = mean(zack[35:46,3,TRUE])
+
+	    tN = n_at_age(indiv)[,]
+
+	    ##This just takes a very long time...
+	    ##N_e sampled
+	    library(abind)
+	    library(adegenet)
+	    library(strataG)
+
+	    sampsForLDNe = varCKMR::rough_sample_size(t(tN),function(y){0.15*y})
+	    sampForLDNe = varCKMR::sample_age_by_year(indiv$population,sampsForLDNe,40:50,1)
+	    samp2ForLDNe = lapply(sampForLDNe,function(x){
+	      do.call(rbind,x)
+	    })
+
+	    getLDNE = function(ped){
+	      pp = lapply(ped,function(by50){
+		Agroup = select(by50,ends_with("_A"))[,1:100]
+		Bgroup = select(by50,ends_with("_B"))[,1:100]
+
+		ABpaste = mapply(function(x,y){
+		  paste0(x,y)},Agroup,Bgroup)
+
+		genindy = df2genind(ABpaste,ploidy=2,ncode=1)
+		gi.g <- genind2gtypes(genindy)
+		ldNeey = ldNe(gi.g,maf.threshold = 0.05,num.cores = 8)
+		ldNeey
+	      })
+	      do.call(rbind,pp)
+	    }
+
+	    getLDNE2 = function(N){
+	      ldNe = list()
+	      for(i in 1:N){
+		sampsForLDNe = varCKMR::rough_sample_size(t(tN),function(y){0.15*y})
+		sampForLDNe = varCKMR::sample_age_by_year(indiv$population,sampsForLDNe,40:50,1)
+		samp2ForLDNe = lapply(sampForLDNe,function(x){
+		  do.call(rbind,x)
+		})
+		ldNeT = getLDNE(samp2ForLDNe)
+		ldNeT$rawNb = 1/(3*(ldNeT[,4]-ldNeT[,5]))
+		CVf = sd(fec)/mean(fec)
+		AL = 3-1+1
+		ldNeT$Nbadj = ldNeT$rawNb/(0.991-0.206*log10(AL)+0.256*log10(3)+0.137*CVf)
+		ldNeT$Neadj = ldNeT$Nbadj/(0.833+0.637*log10(AL)-0.793*log10(3)-0.423*CVf)
+		ldNe[[i]] = ldNeT
+	      }
+	      ldNe
+	    }
+	    dorp = getLDNE2(10)
+	    zap = lapply(1:10,function(x){
+	      y = dorp[[x]][,"Neadj"]
+	      y
+	      })
+	    zap2 = do.call(rbind,zap)
+	    qzap2 = apply(zap2,2,function(x){
+	      quantile(x,c(0.05,0.5,0.95))})
+
+
+	    dfdum = data.frame(ModelN=colSums(exp(report$log_N)),TrueN=rowSums(tN[,]),ModelNe=report$N_e,CrowNe=cNe,LDNE50=qzap2[2,],LDNE5=qzap2[1,],LDNE95=qzap2[3,],year=40:50)
+	    dfdum2 = dfdum |>
+	      gather(key=Ntype,value=N,-LDNE5,-LDNE95,-year)
+
+	    library(ggplot2)
+	    dp1 = ggplot(dfdum2) + geom_line(aes(x=year,y=N,group=Ntype,color=Ntype)) + geom_ribbon(aes(x=year,ymin=LDNE5,ymax=LDNE95),alpha=0.3)
+
+	    popPar = indiv$popPars  
+
+	    dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+	    fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+
+
+	    ldNeEst = getLDNE(samp2ForLDNe)
+	    ldNeEst$rawNb = 1/(3*(ldNeEst[,4]-ldNeEst[,5]))
+	    CVf = sd(fec)/mean(fec)
+	    AL = 3-1+1
+	    ldNeEst$Nbadj = ldNeEst$rawNb/(0.991-0.206*log10(AL)+0.256*log10(3)+0.137*CVf)
+	    ldNeEst$Neadj = ldNeEst$Nbadj/(0.833+0.637*log10(AL)-0.793*log10(3)-0.423*CVf)
+
+
+
+	  condvar <- function(dprob,fec,theta){
+	    firstsum = 0.0
+	    varsy = fec+fec^2/theta
+	    for(i in 1:3){
+	      firstsum = firstsum + dprob[i]*sum(varsy[1:i])
+	    }
+	    secsum = 0.0
+	    for(i in 1:3){
+	      secsum = secsum + (sum(fec[1:i]))^2*(1-dprob[i])*dprob[i]
+	    }
+	    lastsum = 0.0
+	    for(i in 2:3){
+	      for(j in 1:(i-1)){
+		lastsum = lastsum + sum(fec[1:i])*dprob[i]*sum(fec[1:j])*dprob[j]
+	      }
+	    }
+	    tot = firstsum+secsum-2*lastsum
+	    tot
+	  }
+
+	  popPar = indiv$popPars  
+
+	  dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+	  fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+	  surv = c(popPar$surv1,popPar$surv2)
+	  les = make_les(fec,surv)
+
+	    doub_fec = 2*fec
+	    thet = popPar$theta
+	    varsy = doub_fec+doub_fec^2/thet
+
+
+	    growth_rate = max(Re(eigen(les,only.values = TRUE)$values))
+	    surv2 = cumprod(c(1,surv,0))
+	    surv3 = c(surv,0)
+	    fec2 = c(fec,0)
+
+	    repro_value <- function(a){
+	      lx = surv2[a]
+	      vx = 0.0
+	      for(i in a:4){
+		vx = vx+growth_rate^(-i-a+1)*surv2[i]/lx*fec2[i]
+	      }
+	      vx
+	    }
+
+	    rvs = c(repro_value(1),repro_value(2),repro_value(3))
+	    denom = 0.0
+	    for(i in 1:3){
+	      out = surv2[i]*growth_rate^(-i-1)
+	      iner = varsy[i]+surv3[i]*(1-surv3[i])*rvs[i]^2
+	      denom = denom + out*iner
+	      }
+
+
+  gen_length2 <- function(fec,surv,lambda){
+      ells = cumprod(c(1,surv))
+      nn = length(fec)
+      T = 0.0
+      for(i in 1:nn){
+	  T = T + i*lambda^(-i)*ells[i]*fec[i]
+      }
+      T
+  }
+
+	    gl2 = gen_length2(fec,surv,popPar$growth_rate)
+	    crowNe <- function(N,kbar,Vk,L){
+	      nume = (2*N-1)*kbar
+	      denom = 2*(1+Vk/kbar)
+	      nume*L/denom
+	    }
+
+	    tN = tN[41:51,]
+  NeEstSim = (4*tN[,1]*(gl2))/(estvar+estmean)
+  cNe = crowNe(tN[,1],estmean,estvar,gl2)
+  cNeNOL = crowNe(tN[,1],estmean,estvar,1)
+	  realVk = condvar(dprob,fec*2,popPar$theta)
+	  realKbar = sum(cumsum(2*fec)*dprob)
+
+	      library(tidyverse)
+
+
+
+	    NestSC = data.frame(log_N=ssdrSC[rownames(ssdrSC) == "log_N",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_N",2])
+	  NestSC$Llower = NestSC$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestSC$stdErr
+	  NestSC$Lupper = NestSC$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestSC$stdErr
+	  NestSC$lower = exp(NestSC$Llower)
+	  NestSC$upper = exp(NestSC$Lupper)
+	  NestSC$NestSC = exp(NestSC$log_N)
+	  NestSC$Ntrue = as.vector(t(tN))
+	  NestSC$age = rep(c(1,2,3),11)
+
+	  MestSC = data.frame(log_M=ssdrSC[rownames(ssdrSC) == "log_M",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_M",2])
+	  MestSC$Llower = MestSC$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestSC$stdErr
+	  MestSC$Lupper = MestSC$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestSC$stdErr
+	  MestSC$lower = exp(MestSC$Llower)
+	  MestSC$upper = exp(MestSC$Lupper)
+	  MestSC$MestSC = exp(MestSC$log_M)
+	  MestSC$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestSC$age = c(1,2)
+
+	  FecEstSC = data.frame(log_fec=ssdrSC[rownames(ssdrSC) == "log_fecundity",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_fecundity",2])
+	  FecEstSC$Llower = FecEstSC$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstSC$stdErr
+	  FecEstSC$Lupper = FecEstSC$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstSC$stdErr
+	  FecEstSC$lower = exp(FecEstSC$Llower)
+	  FecEstSC$upper = exp(FecEstSC$Lupper)
+	  FecEstSC$FecEstSC = exp(FecEstSC$log_fec)
+	  FecEstSC$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  growth_rateEstSC = data.frame(estSCgrowth_rate = ssdrSC[rownames(ssdrSC) == "growth_rate",1],stdErr = ssdrSC[rownames(ssdrSC) == "growth_rate",2])
+	  growth_rateEstSC$lower = growth_rateEstSC$estSCgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstSC$stdErr
+	  growth_rateEstSC$upper = growth_rateEstSC$estSCgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstSC$stdErr
+	  growth_rateEstSC$trueGR = popPar$growth_rate
+
+
+	  NestMB = data.frame(log_N=ssdrMB[rownames(ssdrMB) == "log_N",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_N",2])
+	  NestMB$Llower = NestMB$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestMB$stdErr
+	  NestMB$Lupper = NestMB$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestMB$stdErr
+	  NestMB$lower = exp(NestMB$Llower)
+	  NestMB$upper = exp(NestMB$Lupper)
+	  NestMB$NestMB = exp(NestMB$log_N)
+	  NestMB$Ntrue = as.vector(t(tN))
+	  NestMB$age = rep(c(1,2,3),11)
+
+	  MestMB = data.frame(log_M=ssdrMB[rownames(ssdrMB) == "log_M",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_M",2])
+	  MestMB$Llower = MestMB$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestMB$stdErr
+	  MestMB$Lupper = MestMB$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestMB$stdErr
+	  MestMB$lower = exp(MestMB$Llower)
+	  MestMB$upper = exp(MestMB$Lupper)
+	  MestMB$MestMB = exp(MestMB$log_M)
+	  MestMB$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestMB$age = c(1,2)
+
+	  FecEstMB = data.frame(log_fec=ssdrMB[rownames(ssdrMB) == "log_fecundity",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_fecundity",2])
+	  FecEstMB$Llower = FecEstMB$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstMB$stdErr
+	  FecEstMB$Lupper = FecEstMB$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstMB$stdErr
+	  FecEstMB$lower = exp(FecEstMB$Llower)
+	  FecEstMB$upper = exp(FecEstMB$Lupper)
+	  FecEstMB$FecEstMB = exp(FecEstMB$log_fec)
+	  FecEstMB$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  thetaEstMB = data.frame(log_theta=ssdrMB[rownames(ssdrMB) == "log_theta",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_theta",2])
+	  thetaEstMB$Llower = thetaEstMB$log_theta - qnorm(0.05/2,lower.tail = FALSE)*thetaEstMB$stdErr
+	  thetaEstMB$Lupper = thetaEstMB$log_theta + qnorm(0.05/2,lower.tail = FALSE)*thetaEstMB$stdErr
+	  thetaEstMB$lower = exp(thetaEstMB$Llower)
+	  thetaEstMB$upper = exp(thetaEstMB$Lupper)
+	  thetaEstMB$thetaEstMB = exp(thetaEstMB$log_theta)
+	  thetaEstMB$thetaTrue = c(popPar$theta)
+
+	  VkEstMB = data.frame(estVk = ssdrMB[rownames(ssdrMB) == "Vk",1],stdErr = ssdrMB[rownames(ssdrMB) == "Vk",2])
+	  VkEstMB$lower = VkEstMB$estVk - qnorm(0.05/2,lower.tail = FALSE)*VkEstMB$stdErr
+	  VkEstMB$upper = VkEstMB$estVk + qnorm(0.05/2,lower.tail = FALSE)*VkEstMB$stdErr
+	  VkEstMB$fromSim = estvar
+	  VkEstMB$fromSimPar = realVk
+
+	  growth_rateEstMB = data.frame(estgrowth_rate = ssdrMB[rownames(ssdrMB) == "growth_rate",1],stdErr = ssdrMB[rownames(ssdrMB) == "growth_rate",2])
+	  growth_rateEstMB$lower = growth_rateEstMB$estgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMB$stdErr
+	  growth_rateEstMB$upper = growth_rateEstMB$estgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMB$stdErr
+	  growth_rateEstMB$trueGR = popPar$growth_rate
+
+	  N_eEstMB = data.frame(estN_e = ssdrMB[rownames(ssdrMB) == "N_e",1],stdErr = ssdrMB[rownames(ssdrMB) == "N_e",2])
+	  N_eEstMB$lower = N_eEstMB$estN_e - qnorm(0.05/2,lower.tail = FALSE)*N_eEstMB$stdErr
+	  N_eEstMB$upper = N_eEstMB$estN_e + qnorm(0.05/2,lower.tail = FALSE)*N_eEstMB$stdErr
+	    N_eEstMB$fromSim = cNe
+	    N_eEstMB$LDNE = ldNeEst$Neadj
+
+
+	  
+
+
+	  ret = list(optSC=optSC,convergedSC=optSC$convergence,reportSC=reportSC,NestSC=NestSC,MestSC=MestSC,FecEstSC=FecEstSC,
+		     growth_rateEstSC=growth_rateEstSC,
+		     optMB=optMB,convergedMB=optMB$convergence,reportMB=reportMB,NestMB=NestMB,MestMB=MestMB,FecEstMB=FecEstMB,thetaEstMB=thetaEstMB,VkEstMB=VkEstMB,
+		     growth_rateEstMB=growth_rateEstMB,N_eEstMB=N_eEstMB)
+
+
+	    fitteddir = paste0(rep_df[[k]]$foldname[1],"/fitted/")
+	    if(!dir.exists(fitteddir)){
+	      dir.create(fitteddir)
+	    }
+
+	    saveRDS(ret,file=paste0(fitteddir,"fittedR",str_pad(rr,4,pad="0"),".rds"))
+	  }
+	}
+
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit1.R :var repdf="../sims/rep_df1.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit2.R :var repdf="../sims/rep_df2.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit3.R :var repdf="../sims/rep_df3.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit4.R :var repdf="../sims/rep_df4.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit5.R :var repdf="../sims/rep_df5.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+#+begin_src R :exports none :eval never :tangle ./scripts/simFit6.R :var repdf="../sims/rep_df6.rds" :noweb yes
+<<simFit>>
+#+end_src
+
+
+
+
+
+
+
+
+
+
+#+begin_src R :session simsFree :exports none :eval never :tangle ./scripts/simFree.R
+library(readr)
+
+  folders = list.dirs("../sims2",full.names = TRUE)
+  ffolders = folders[grep("/fitted",folders)]
+
+  rmse = function(x,xtrue){
+    sqrt(sum((x-xtrue)^2)/length(x))
+  }
+
+  popbit =  regexec("pop[0-9][0-9][0-9][0-9]",ffolders)
+  mlength = sapply(popbit,function(x){attributes(x)$match.length})
+  popID = unique(do.call(substring,list(text=ffolders,first=popbit,last=unlist(popbit)+mlength-1)))
+
+  get_dat_from_fitted <- function(file,sim){
+    dat = readRDS(file)
+    dat$Mest$sim = sim
+    dat$Nest$sim = sim
+    dat$Nest$year = sort(rep(1:11,3))
+    dat$FecEst$sim = sim
+    dat$FecEst$age = 1:3
+    dat$thetaEst$sim = sim
+    dat$VkEst$sim = sim
+    dat$growth_rateEst$sim = sim
+
+    dat$MestSC$sim = sim
+    dat$NestSC$sim = sim
+    dat$NestSC$year = sort(rep(1:11,3))
+    dat$FecEstSC$sim = sim
+    dat$FecEstSC$age = 1:3
+    dat$growth_rateEstSC$sim = sim
+    dat$N_eEst$sim = sim
+    dat$N_eEst$year = 1:11
+
+    ##RMSE
+    dat$Mest$RMSE = apply(dat$Mest,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$Nest$RMSE = apply(dat$Nest,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$FecEst$RMSE = apply(dat$FecEst,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$thetaEst$RMSE = apply(dat$thetaEst,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$VkEst$RMSE = apply(dat$VkEst,1,function(x){
+      rmse(x[1],x[5])
+    })
+    dat$growth_rateEst$RMSE = apply(dat$growth_rateEst,1,function(x){
+      rmse(x[1],x[5])
+    })
+    Nrmse = rmse(dat$Nest$Nest,dat$Nest$Ntrue)
+
+    dat$MestSC$RMSE = apply(dat$MestSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$NestSC$RMSE = apply(dat$NestSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$FecEstSC$RMSE = apply(dat$FecEstSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$growth_rateEstSC$RMSE = apply(dat$growth_rateEstSC,1,function(x){
+      rmse(x[1],x[5])
+    })
+    NrmseSC = rmse(dat$NestSC$NestSC,dat$NestSC$Ntrue)
+    ret = with(dat,list(Mest=Mest,Nest=Nest,FecEst=FecEst,
+			thetaEst=thetaEst,VkEst=VkEst,
+			growth_rateEst=growth_rateEst,
+			MestSC=MestSC,
+			NestSC=NestSC,
+			FecEstSC=FecEstSC,
+			growth_rateEstSC=growth_rateEstSC,
+			Nrmse=Nrmse,NrmseSC=NrmseSC,
+			N_eEst = N_eEst,
+			converged=dat$converged,convergedSC=dat$convergedSC))
+    ret
+  }
+
+
+
+  get_dat_from_fittedNEW <- function(file,sim){
+    dat = readRDS(file)
+    dat$Mest$sim = sim
+    dat$Nest$sim = sim
+    dat$Nest$year = sort(rep(1:11,3))
+    dat$FecEst$sim = sim
+    dat$FecEst$age = 1:3
+    dat$thetaEst$sim = sim
+    dat$VkEst$sim = sim
+    dat$growth_rateEst$sim = sim
+    dat$N_eEst$sim = sim
+    dat$N_eEst$year = 1:11
+
+
+
+    dat$MestSC$sim = sim
+    dat$NestSC$sim = sim
+    dat$NestSC$year = sort(rep(1:11,3))
+    dat$FecEstSC$sim = sim
+    dat$FecEstSC$age = 1:3
+    dat$growth_rateEstSC$sim = sim
+
+    dat$MestMB$sim = sim
+    dat$NestMB$sim = sim
+    dat$NestMB$year = sort(rep(1:11,3))
+    dat$FecEstMB$sim = sim
+    dat$FecEstMB$age = 1:3
+    dat$thetaEstMB$sim = sim
+    dat$VkEstMB$sim = sim
+    dat$growth_rateEstMB$sim = sim
+    dat$N_eEstMB$sim = sim
+    dat$N_eEstMB$year = 1:11
+
+
+
+    ##RMSE
+    dat$Mest$RMSE = apply(dat$Mest,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$Nest$RMSE = apply(dat$Nest,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$FecEst$RMSE = apply(dat$FecEst,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$thetaEst$RMSE = apply(dat$thetaEst,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$VkEst$RMSE = apply(dat$VkEst,1,function(x){
+      rmse(x[1],x[5])
+    })
+    dat$growth_rateEst$RMSE = apply(dat$growth_rateEst,1,function(x){
+      rmse(x[1],x[5])
+    })
+    Nrmse = rmse(dat$Nest$Nest,dat$Nest$Ntrue)
+
+    dat$MestSC$RMSE = apply(dat$MestSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$NestSC$RMSE = apply(dat$NestSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$FecEstSC$RMSE = apply(dat$FecEstSC,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$growth_rateEstSC$RMSE = apply(dat$growth_rateEstSC,1,function(x){
+      rmse(x[1],x[5])
+    })
+    NrmseSC = rmse(dat$NestSC$NestSC,dat$NestSC$Ntrue)
+
+    dat$MestMB$RMSE = apply(dat$MestMB,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$NestMB$RMSE = apply(dat$NestMB,1,function(x){
+      rmse(x[7],x[8])
+      })
+    dat$FecEstMB$RMSE = apply(dat$FecEstMB,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$thetaEstMB$RMSE = apply(dat$thetaEstMB,1,function(x){
+      rmse(x[7],x[8])
+    })
+    dat$VkEstMB$RMSE = apply(dat$VkEstMB,1,function(x){
+      rmse(x[1],x[5])
+    })
+    dat$growth_rateEstMB$RMSE = apply(dat$growth_rateEstMB,1,function(x){
+      rmse(x[1],x[5])
+    })
+    NrmseMB = rmse(dat$NestMB$Nest,dat$NestMB$Ntrue)
+
+
+
+    ret = with(dat,list(Mest=Mest,Nest=Nest,FecEst=FecEst,
+			thetaEst=thetaEst,VkEst=VkEst,
+			growth_rateEst=growth_rateEst,
+			MestSC=MestSC,
+			NestSC=NestSC,
+			FecEstSC=FecEstSC,
+			growth_rateEstSC=growth_rateEstSC,
+			Nrmse=Nrmse,NrmseSC=NrmseSC,
+			N_eEst = N_eEst,
+			converged=dat$converged,convergedSC=dat$convergedSC,
+			MestMB=MestMB,NestMB=NestMB,
+			FecEstMB=FecEstMB,thetaEstMB=thetaEstMB,
+			VkEstMB=VkEstMB,growth_rateEstMB=growth_rateEstMB,
+			NrmseMB=NrmseMB))
+
+    ret
+  }
+
+  get_data_from_files <- function(folder){
+    files = list.files(folder,"*.rds")
+    filesFN = list.files(folder,"*.rds",full.names = TRUE)
+    sims = parse_number(files)
+
+    ##Do the first one
+    dat =  get_dat_from_fitted(filesFN[1],sims[1])
+
+    for(i in 2:length(filesFN)){
+      datTem = get_dat_from_fitted(filesFN[i],sims[i])
+      dat = mapply(function(d,t){
+	rbind(d,t)},d=dat,t=datTem)
+    }
+    dat
+  }
+
+  get_data_from_filesNEW <- function(folder){
+    files = list.files(folder,"*.rds")
+    filesFN = list.files(folder,"*.rds",full.names = TRUE)
+    sims = parse_number(files)
+
+    ##Do the first one
+    dat =  get_dat_from_fittedNEW(filesFN[1],sims[1])
+
+    for(i in 2:length(filesFN)){
+      datTem = get_dat_from_fittedNEW(filesFN[i],sims[i])
+      dat = mapply(function(d,t){
+	rbind(d,t)},d=dat,t=datTem)
+    }
+    dat
+  }
+
+
+  library(ggplot2)
+
+  quantileNE = readRDS("~/varCKMR3/quantileNE.rds")
+
+  make_plots_from_data <- function(data,scenario){
+      grdensitySC = ggplot(data$growth_rateEstSC,aes(x=estSCgrowth_rate))+
+      geom_density() + geom_vline(aes(xintercept=unique(data$growth_rateEst$trueGR)),color="blue",linetype="dashed") + xlab("Growth Rate") + ggtitle(paste("Growth Rate - No same cohort  - ",scenario))
+    MestDensitySC = ggplot(data$MestSC,aes(x=MestSC))+ geom_density() + geom_vline(aes(xintercept=data$Mest$Mtrue),color="blue",linetype="dashed") + xlab("M") + ggtitle(paste("M - No same cohort - ",scenario)) + facet_wrap(~age)
+    FecEstDensitySC = ggplot(data$FecEstSC,aes(x=FecEstSC))+ geom_density() + geom_vline(aes(xintercept=data$FecEst$FecTrue),color="blue",linetype="dashed") + xlab("Fecundity") + ggtitle(paste("Fecundity - No Same Cohort - ",scenario)) + facet_wrap(~age,scales="free")
+    NestDensitySC = ggplot(data$NestSC[data$NestSC$year == 1,],aes(x=NestSC)) + geom_density() + geom_vline(aes(xintercept=data$Nest$Ntrue[data$Nest$year == 1]),
+												   color="blue",linetype="dashed") + xlab("Numbers at age")+
+      ggtitle(paste("N - No same Cohort - ",scenario)) + facet_wrap(~age,scales="free")
+
+      get_xy_lims <- function(plot){
+	orb = ggplot_build(plot)$layout
+	xranges = lapply(orb$panel_params,function(x){x$x.range})
+	yranges = lapply(orb$panel_params,function(x){x$y.range})
+	ret = list(xranges=xranges,yranges=yranges)
+	ret
+	}
+
+
+
+
+
+    grdensity = ggplot(data$growth_rateEst,aes(x=estgrowth_rate))+
+      geom_density() + geom_vline(aes(xintercept=unique(data$growth_rateEst$trueGR)),color="blue",linetype="dashed") + xlab("Growth Rate") + ggtitle(paste("Growth Rate - ",scenario))
+      thetadensity = ggplot(data$thetaEst[data$thetaEst$thetaEst < 20,],aes(x=thetaEst))+
+	geom_density() + geom_vline(aes(xintercept=unique(data$thetaEst$thetaTrue)),color="blue",linetype="dashed") + xlab("Theta") + ggtitle(paste("Theta - ",scenario))
+    MestDensity = ggplot(data$Mest,aes(x=Mest))+ geom_density() + geom_vline(aes(xintercept=data$Mest$Mtrue),color="blue",linetype="dashed") + xlab("M") + ggtitle(paste("M - ",scenario)) + facet_wrap(~age)
+    FecEstDensity = ggplot(data$FecEst,aes(x=FecEst))+ geom_density() + geom_vline(aes(xintercept=data$FecEst$FecTrue),color="blue",linetype="dashed") + xlab("Fecundity") + ggtitle(paste("Fecundity - ",scenario)) + facet_wrap(~age,scales="free")
+    VkEstDensity = ggplot(data$VkEst,aes(x=estVk))+ geom_density() + geom_vline(aes(xintercept=data$VkEst$fromSim),color="blue",linetype="dashed") + xlab("Variance of Lifetime Reproductive Success") + ggtitle(paste("Vk - ",scenario))
+    NestDensity = ggplot(data$Nest[data$Nest$year == 1,],aes(x=Nest)) + geom_density() + geom_vline(aes(xintercept=data$Nest$Ntrue[data$Nest$year == 1]),
+												   color="blue",linetype="dashed") + xlab("Numbers at age")+
+      ggtitle(paste("N - ",scenario)) + facet_wrap(~age,scales="free")
+
+
+    ret = list(grdensity=grdensity,thetadensity=thetadensity,MestDensity=MestDensity,
+	       FecEstDensity=FecEstDensity,VkEstDensity=VkEstDensity,NestDensity=NestDensity,
+	       grdensitySC=grdensitySC,MestDensitySC=MestDensitySC,FecEstDensitySC=FecEstDensitySC,
+	       NestDensitySC=NestDensitySC)
+    ret
+  }
+
+  check_rmse_diffs <- function(data){
+    grrmse = sum(data$growth_rateEst$RMSE < data$growth_rateEstMB$RMSE)/length(data$growth_rateEst$RMSE) 
+    Mrmse = sum(data$Mest$RMSE < data$MestMB$RMSE)/length(data$Mest$RMSE)
+    FecRmse = sum(data$FecEst$RMSE < data$FecEstMB$RMSE)/length(data$FecEst$RMSE)
+    Nrmse = sum(data$Nest$RMSE < data$NestMB$RMSE)/length(data$Nest$RMSE)
+    Noverall = sum(data$Nrmse < data$NrmseMB)/length(data$Nrmse)
+    theta = sum(data$thetaEst$RMSE < data$thetaEstMB$RMSE)
+
+    ret = data.frame(growth=grrmse,M=Mrmse,Fec=FecRmse,N=Nrmse,Noverall=Noverall)
+    ret
+  }
+
+
+  quantile_bits <- function(data){
+    probs = c(0.05,0.5,0.95)
+    fecA = split(data$FecEst,data$FecEst$age)
+    fecAQ = t(sapply(fecA,function(x){quantile(x$FecEst,probs)}))
+    fecAQ = as.data.frame(cbind(fecAQ,true=unique(data$FecEst$FecTrue)))
+
+    fecASC = split(data$FecEstSC,data$FecEstSC$age)
+    fecAQSC = as.data.frame(t(sapply(fecASC,function(x){quantile(x$FecEst,probs)})))
+
+    fecC = data.frame(parm=c("fec1","fec2","fec3"))
+    fecC = cbind(fecC,fecAQ,fecAQSC)
+
+    MA = split(data$Mest,data$Mest$age)
+    MAQ = t(sapply(MA,function(x){quantile(x$Mest,probs)}))
+    MAQ = as.data.frame(cbind(MAQ,true=unique(data$Mest$Mtrue)))
+
+    MASC = split(data$MestSC,data$MestSC$age)
+    MAQSC = as.data.frame(t(sapply(MASC,function(x){quantile(x$MestSC,probs)})))
+
+    MC = data.frame(parm=c("M1","M2"))
+    MC = cbind(MC,MAQ,MAQSC)
+
+    NestA = split(data$Nest[data$Nest$year == 5,],data$Nest$age[data$Nest$year == 5])
+    NestAQ = t(sapply(NestA,function(x){quantile(x$Nest,probs)}))
+    NestAQ = as.data.frame(cbind(NestAQ,true=unique(data$Nest$Ntrue[data$Nest$year == 5])))
+
+  NestASC = split(data$NestSC[data$NestSC$year == 5,],data$NestSC$age[data$NestSC$year == 5])
+    NestAQSC = as.data.frame(t(sapply(NestASC,function(x){quantile(x$NestSC,probs)})))
+
+    NestC = data.frame(parm=c("N1Y5","N2Y5","N3Y5"))
+    NestC = cbind(NestC,NestAQ,NestAQSC)
+
+
+    thetaA = c("theta",quantile(data$thetaEst$thetaEst,probs),unique(data$thetaEst$thetaTrue),NA,NA,NA)
+
+    combo = rbind(fecC,MC,NestC,thetaA)
+    combo[,2:8] = apply(combo[,2:8],2,as.numeric)
+    combo[,2:8] = round(combo[,2:8],3)
+    combo
+    }
+
+
+
+  quantile_bits2 <- function(data){
+    probs = c(0.05,0.5,0.95)
+    fecA = split(data$FecEst,data$FecEst$age)
+    fecAQ = t(sapply(fecA,function(x){quantile(x$FecEst,probs)}))
+    fecAQ = as.data.frame(cbind(fecAQ,true=unique(data$FecEst$FecTrue)))
+
+    fecAMB = split(data$FecEstMB,data$FecEstMB$age)
+    fecAQMB = as.data.frame(t(sapply(fecAMB,function(x){quantile(x$FecEst,probs)})))
+
+    fecC = data.frame(parm=c("fec1","fec2","fec3"))
+    fecC = cbind(fecC,fecAQ,fecAQMB)
+
+    MA = split(data$Mest,data$Mest$age)
+    MAQ = t(sapply(MA,function(x){quantile(x$Mest,probs)}))
+    MAQ = as.data.frame(cbind(MAQ,true=unique(data$Mest$Mtrue)))
+
+    MAMB = split(data$MestMB,data$MestMB$age)
+    MAQMB = as.data.frame(t(sapply(MAMB,function(x){quantile(x$MestMB,probs)})))
+
+    MC = data.frame(parm=c("M1","M2"))
+    MC = cbind(MC,MAQ,MAQMB)
+
+    NestA = split(data$Nest[data$Nest$year == 5,],data$Nest$age[data$Nest$year == 5])
+    NestAQ = t(sapply(NestA,function(x){quantile(x$Nest,probs)}))
+    NestAQ = as.data.frame(cbind(NestAQ,true=unique(data$Nest$Ntrue[data$Nest$year == 5])))
+
+  NestAMB = split(data$NestMB[data$NestMB$year == 5,],data$NestMB$age[data$NestMB$year == 5])
+    NestAQMB = as.data.frame(t(sapply(NestAMB,function(x){quantile(x$NestMB,probs)})))
+
+    NestC = data.frame(parm=c("N1Y5","N2Y5","N3Y5"))
+    NestC = cbind(NestC,NestAQ,NestAQMB)
+
+    Vk = quantile(data$VkEst$estVk,probs) 
+    VkMB = quantile(data$VkEstMB$estVk,probs)
+    VkA = c("Vk",Vk,unique(data$VkEst$fromSimPar),VkMB)
+  
+    thetaA = c("theta",quantile(data$thetaEst$thetaEst,probs),unique(data$thetaEst$thetaTrue),quantile(data$thetaEstMB$thetaEstMB,probs))
+
+    combo = rbind(fecC,MC,NestC,thetaA,VkA)
+    combo[,2:8] = apply(combo[,2:8],2,as.numeric)
+    combo[,2:8] = round(combo[,2:8],3)
+    combo
+    }
+
+
+
+  quantile_ldne <- function(data){
+    ldne = data$N_eEst
+    ldney = split(ldne,ldne$year)
+    qldne = sapply(ldney,function(x){
+      quantile(x$LDNE,c(0.05,0.5,0.95))
+    })
+
+    qldneE = sapply(ldney,function(x){
+      quantile(x$estN_e,c(0.05,0.5,0.95))
+    })
+    tqldne = as.data.frame(t(qldne))
+    tqldne$type = "AdjNe"
+    tqldneE = as.data.frame(t(qldneE))
+    tqldneE$type = "ModelEstimate"
+    cbind(tqldne,tqldneE)
+  }
+
+  quantile_neMB <- function(data){
+    ldne = data$N_eEst
+    ldney = split(ldne,ldne$year)
+    ## qldne = sapply(ldney,function(x){
+    ##   quantile(x$LDNE,c(0.05,0.5,0.95))
+    ## })
+
+    qldneE = sapply(ldney,function(x){
+      quantile(x$estN_e,c(0.05,0.5,0.95))
+    })
+  #  tqldne = as.data.frame(t(qldne))
+   # tqldne$type = "AdjNe"
+    tqldneE = as.data.frame(t(qldneE))
+    tqldneE$type = "MBModelEstimate"
+    cbind(tqldne,tqldneE)
+  }
+M
+
+
+
+
+  plots = list()
+  rmses = list()
+  converged = list()
+  convergedSC = list()
+  quantiles = list()
+  quantileNE = list()
+  popPars = list()
+  for(i in 1:length(ffolders)){
+    data = get_data_from_filesNEW(ffolders[i])
+    quantiles[[i]] = quantile_bits2(data)
+   # quantileNE[[i]] = quantile_ldne(data)
+  }
+
+  #saveRDS(quantileNE,file="~/varCKMR3/quantileNE.rds")
+
+
+  for(i in 1:length(ffolders)){
+    indiv = readRDS(paste0("../populations/",popID[i],".rds"))
+    popPars[[i]] = indiv$popPars
+    sim_scenario = paste("Growth Rate: ",indiv$popPars$growth_rate,"Theta: ",indiv$popPars$theta)
+    data = get_data_from_filesNEW(ffolders[i])
+    converged[[i]] = data$converged
+    convergedSC[[i]] = data$convergedSC
+    plots[[i]] = make_plots_from_data(data,sim_scenario)
+    rmses[[i]] = check_rmse_diffs(data)
+    rmses[[i]]$scenario = sim_scenario
+  }
+
+
+  pPars = do.call(rbind,popPars)
+  library(tidyverse)
+
+  gen_length2 <- function(fec,surv,lambda){
+    ells = cumprod(c(1,surv))
+    nn = length(fec)
+    T = 0.0
+    for(i in 1:nn){
+      T = T + i*lambda^(-i)*ells[i]*fec[i]
+    }
+    T
+  }
+
+  dprobs = function(surv){
+    dprob = numeric(length(surv)+1)
+    for(i in 1:length(dprob)){
+      if(i == 1){
+	dprob[i] = 1-surv[i]
+      }else if(i == length(surv)+1){
+	dprob[i] = tail(cumprod(surv[1:(i-1)]),1)
+      }else{
+	dprob[i] = tail(cumprod(surv[1:(i-1)]),1)*(1-surv[i])
+      }
+
+    }
+    dprob
+  }
+
+
+  crowNe <- function(N,k,L,Vk){
+    top = (2*N-1)*k*L
+    bot = 2*(1+Vk/k)
+    top/bot
+  }
+
+
+  Neplots = list()
+  Neplots2 = list()
+  for(i in 1:length(ffolders)){
+    data = get_data_from_files(ffolders[i])
+    NTru = data$Nest |>
+      group_by(year) |>
+      distinct(Ntrue) |>
+      summarise(Ntrue=sum(Ntrue))
+
+    NTru1 = data$Nest |>
+      filter(age == 1) |>
+      group_by(year) |>
+      distinct(Ntrue)
+
+    Vk = unique(data$VkEst$fromSimPar)
+    fff = unique(data$FecEst$FecTrue)
+    sss = exp(-unique(data$Mest$Mtrue))
+    dp = dprobs(sss)
+    kbar = sum(cumsum(fff*2)*dp)
+  
+
+    sim = 500
+    zorp = data$N_eEst[data$N_eEst$sim == sim,]
+    gr = pPars[i,2]
+    theta = pPars[i,3]
+    gl = gen_length2(fff,sss,gr)
+
+  crowNes = numeric(nrow(NTru))
+    for(j in 1:length(crowNes)){
+      crowNes[j] = crowNe(NTru1[j,1],kbar,gl,Vk)
+    }
+
+    crowNes = as.vector(do.call(rbind,crowNes))
+  
+    qNe = quantileNE[[i]]
+    N = c(crowNes,qNe[,2],qNe[,6])
+    Ntype = c(rep("FromSimPar",11),qNe[,4],qNe[,8])
+    NLo = c(rep(NA,11),qNe[,1],qNe[,5])
+    NHi = c(rep(NA,11),qNe[,3],qNe[,7])
+    df = data.frame(year=rep(40:50,3),N=N,Ntype=Ntype,NLo=NLo,NHi=NHi)
+    Neplots[[i]] = ggplot(df) + geom_line(aes(x=year,y=N,group=Ntype,color=Ntype)) + geom_ribbon(aes(x=year,ymin=NLo,ymax=NHi,group=Ntype,fill=Ntype),alpha=0.2) +ggtitle(paste("Vk=",round(Vk,2),"Growth Rate=",round(gr,2),"Theta=",round(theta,2)))
+
+    df2 = data.frame(year=rep(40:50,4),N=c(zorp[,1],zorp[,6],NTru$Ntrue,qNe[,2]),Ntype=c(rep("estNe",11),rep("LDNE1",11),rep("N",11),rep("AdjNe",11)),
+		     NLo = c(zorp[,3],rep(NA,11),rep(NA,11),qNe[,1]),NHi = c(zorp[,4],rep(NA,11),rep(NA,11),qNe[,3]))
+      Neplots2[[i]] = ggplot(df2) + geom_line(aes(x=year,y=N,group=Ntype,color=Ntype)) + geom_ribbon(aes(x=year,ymin=NLo,ymax=NHi,group=Ntype,fill=Ntype),alpha=0.2) +ggtitle(paste("Vk=",round(Vk,2),"Growth Rate=",round(gr,2),"Theta=",round(theta,2)))
+
+  }
+
+
+
+  pdf(file="Neplots.pdf")
+  for(i in 1:length(Neplots)){
+    print(Neplots[[i]])
+  }
+  dev.off()
+
+  coup = do.call(rbind,rmses)
+  sim_scenario = coup$scenario
+
+  conv = data.frame(scenario=sim_scenario,conv=sapply(converged,sum))
+
+
+  RMSEtab = coup[,c(6,5,1,2,3)]
+  RMSEtab[,2:5] = round(RMSEtab[,2:5],2)
+
+
+
+
+  ##Make 
+  data = get_data_from_files(ffolders[4])
+
+  scenario = paste("Growth Rate: ",0.95," Theta: ", 0.75)
+    NestDensitySC = ggplot(data$NestSC[data$NestSC$year == 1,],aes(x=NestSC)) + geom_density() + geom_vline(aes(xintercept=data$Nest$Ntrue[data$Nest$year == 1]),
+												   color="blue",linetype="dashed") + xlab("Numbers at age")+
+      ggtitle(paste("N - within-cohort excluded- ",scenario)) + facet_wrap(~age,scales="free")
+
+  library(cowplot)
+
+#+end_src
+
+
+#+NAME:sensanalysis
+#+begin_src R :exports code :eval never :tangle ./scripts/sensanalysis.R
+    library(TMB)
+    library(tidyverse)
+    library(stringr)
+    library(varCKMR)
+
+    if(!file.exists("../models/ssmodelAdj.o")){
+      compile("../models/ssmodelAdj.cpp")
+    }
+    if(!file.exists("../models/ssmodelNoSC.o")){
+      compile("../models/ssmodelNoSC.cpp")
+    }
+    if(!file.exists("../models/ssmodelMVP.o")){
+      compile("../models/ssmodelMVP.cpp")
+    }
+
+
+
+    dyn.load(dynlib("../models/ssmodelAdj"))
+    dyn.load(dynlib("../models/ssmodelNoSC"))
+    dyn.load(dynlib("../models/ssmodelMVP"))
+
+
+    rep_df = readRDS(repdf)
+
+
+	for(k in 1:1){
+
+	  files = list.files(paste0(rep_df[[k]]$foldname[1]),pattern = "*.rds",full.names = TRUE)
+	  popbit =  regexec("pop[0-9][0-9][0-9][0-9]",files)
+	  mlength = sapply(popbit,function(x){attributes(x)$match.length})
+	  popID = unique(do.call(substring,list(text=files,first=popbit,last=unlist(popbit)+mlength-1)))
+
+	  for(rr in 1:length(files)){
+	    print(rr)
+	    stuff = readRDS(files[rr])
+
+	    dat = stuff$data
+	    dat$skipsame = 0
+	    parm = stuff$parm
+	    parm$log_init_tot_N = 10
+
+	  mapp2 = list(log_M=as.factor(c(1,2,NA)),log_init_tot_N=as.factor(c(1)),
+		       log_fecundity=as.factor(c(1,2,3)),log_theta=as.factor(c(1)))
+
+
+	  ##No SC cohort
+	  datSC = stuff$data
+	  datSC$SIBsSC = NULL
+	  parmSC = parm
+	  parmSC$log_theta = NULL
+	  mapp2SC = mapp2
+	  mapp2SC$log_theta = NULL
+	  objSC = MakeADFun(datSC,parmSC,map = mapp2SC, DLL="ssmodelNoSC")
+	  optSC = nlminb(objSC$par,objSC$fn,objSC$gr,control=list(iter.max=5000))
+	  reportSC = objSC$report()
+	  sdrSC = sdreport(objSC)
+	    ssdrSC = summary(sdrSC)
+
+	    ##MB version
+	    datMB = stuff$data
+	    datMB$skipsame = 0
+	    parmMB = stuff$parm
+
+	    objMB = MakeADFun(datMB,parmMB,map=mapp2,DLL="ssmodelAdj")
+	    optMB = nlminb(objMB$par,objMB$fn,objMB$gr,control=list(iter.max=5000))
+	    reportMB = objMB$report()
+	    sdrMB = sdreport(objMB)
+	    ssdrMB = summary(sdrMB)
+
+
+	    ##MVP sensitivity analysis
+	    ##Theta here is "c", var_power is gamma
+	    datMVP2 = stuff$data
+	    datMVP2$skipsame = 0
+	    parmMVP2 = stuff$parm
+	    parmMVP2$var_power = 2
+	    mapp3 = mapp2
+	    mapp3$log_theta = as.factor(1)
+	    mapp3$var_power = as.factor(NA)
+
+	    objMVP2 = MakeADFun(datMVP2,parmMVP2,map=mapp3,DLL="ssmodelMVP")
+	    optMVP2 = nlminb(objMVP2$par,objMVP2$fn,objMVP2$gr,control=list(iter.max=5000))
+	    reportMVP2 = objMVP2$report()
+	    sdrMVP2 = sdreport(objMVP2)
+	    ssdrMVP2 = summary(sdrMVP2)
+
+
+	    datMVP1 = stuff$data
+	    datMVP1$skipsame = 0
+	    parmMVP1 = stuff$parm
+	    parmMVP1$var_power = 2
+	    mapp3 = mapp2
+	    mapp3$log_theta = as.factor(1)
+	    mapp3$var_power = as.factor(NA)
+
+	    objMVP1 = MakeADFun(datMVP1,parmMVP1,map=mapp3,DLL="ssmodelMVP")
+	    optMVP1 = nlminb(objMVP1$par,objMVP1$fn,objMVP1$gr,control=list(iter.max=5000))
+	    reportMVP1 = objMVP1$report()
+	    sdrMVP1 = sdreport(objMVP1)
+	    ssdrMVP1 = summary(sdrMVP1)
+
+          
+
+	  ##Find variance 
+	  indiv = readRDS(paste0("../populations/",popID,".rds"))
+	  ped = make_ped(indiv)
+
+
+	    pp = ped$pedigree
+
+	    momkids = pp |>
+	      group_by(mother) |>
+	      summarise(n=n()) |>
+	      dplyr::rename(ID=mother)
+
+	    dadkids = pp |>
+	      group_by(father) |>
+	      summarise(n=n()) |>
+	      dplyr::rename(ID=father)
+
+	    zorp = data.frame(ID=pp$ID,birth_year=pp$birth_year)
+	    zorp = left_join(zorp,momkids)
+	    zorp = left_join(zorp,dadkids,by="ID")
+	    zorp[is.na(zorp)] = 0
+	    zorp$kids = zorp$n.x+zorp$n.y
+
+	    zack = zorp |>
+	      group_by(birth_year) |>
+	      summarise(var=var(kids),mean=mean(kids))
+
+	      estvar = mean(zack[35:46,2,TRUE])
+	      estmean = mean(zack[35:46,3,TRUE])
+
+	    tN = n_at_age(indiv)[,]
+
+	    ##This just takes a very long time...
+	    ##N_e sampled
+	    ## library(abind)
+	    ## library(adegenet)
+	    ## library(strataG)
+
+	    ## sampsForLDNe = varCKMR::rough_sample_size(t(tN),function(y){0.15*y})
+	    ## sampForLDNe = varCKMR::sample_age_by_year(indiv$population,sampsForLDNe,40:50,1)
+	    ## samp2ForLDNe = lapply(sampForLDNe,function(x){
+	    ##   do.call(rbind,x)
+	    ## })
+
+	    ## getLDNE = function(ped){
+	    ##   pp = lapply(ped,function(by50){
+	    ##     Agroup = select(by50,ends_with("_A"))[,1:100]
+	    ##     Bgroup = select(by50,ends_with("_B"))[,1:100]
+
+	    ##     ABpaste = mapply(function(x,y){
+	    ##       paste0(x,y)},Agroup,Bgroup)
+
+	    ##     genindy = df2genind(ABpaste,ploidy=2,ncode=1)
+	    ##     gi.g <- genind2gtypes(genindy)
+	    ##     ldNeey = ldNe(gi.g,maf.threshold = 0.05,num.cores = 8)
+	    ##     ldNeey
+	    ##   })
+	    ##   do.call(rbind,pp)
+	    ## }
+
+	    ## getLDNE2 = function(N){
+	    ##   ldNe = list()
+	    ##   for(i in 1:N){
+	    ##     sampsForLDNe = varCKMR::rough_sample_size(t(tN),function(y){0.15*y})
+	    ##     sampForLDNe = varCKMR::sample_age_by_year(indiv$population,sampsForLDNe,40:50,1)
+	    ##     samp2ForLDNe = lapply(sampForLDNe,function(x){
+	    ##       do.call(rbind,x)
+	    ##     })
+	    ##     ldNeT = getLDNE(samp2ForLDNe)
+	    ##     ldNeT$rawNb = 1/(3*(ldNeT[,4]-ldNeT[,5]))
+	    ##     CVf = sd(fec)/mean(fec)
+	    ##     AL = 3-1+1
+	    ##     ldNeT$Nbadj = ldNeT$rawNb/(0.991-0.206*log10(AL)+0.256*log10(3)+0.137*CVf)
+	    ##     ldNeT$Neadj = ldNeT$Nbadj/(0.833+0.637*log10(AL)-0.793*log10(3)-0.423*CVf)
+	    ##     ldNe[[i]] = ldNeT
+	    ##   }
+	    ##   ldNe
+	    ## }
+	    ## dorp = getLDNE2(10)
+	    ## zap = lapply(1:10,function(x){
+	    ##   y = dorp[[x]][,"Neadj"]
+	    ##   y
+	    ##   })
+	    ## zap2 = do.call(rbind,zap)
+	    ## qzap2 = apply(zap2,2,function(x){
+	    ##   quantile(x,c(0.05,0.5,0.95))})
+
+
+	    ## dfdum = data.frame(ModelN=colSums(exp(report$log_N)),TrueN=rowSums(tN[,]),ModelNe=report$N_e,CrowNe=cNe,LDNE50=qzap2[2,],LDNE5=qzap2[1,],LDNE95=qzap2[3,],year=40:50)
+	    ## dfdum2 = dfdum |>
+	    ##   gather(key=Ntype,value=N,-LDNE5,-LDNE95,-year)
+
+	    ## library(ggplot2)
+	    ## dp1 = ggplot(dfdum2) + geom_line(aes(x=year,y=N,group=Ntype,color=Ntype)) + geom_ribbon(aes(x=year,ymin=LDNE5,ymax=LDNE95),alpha=0.3)
+
+	    popPar = indiv$popPars  
+
+	    dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+	    fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+
+
+	    ## ldNeEst = getLDNE(samp2ForLDNe)
+	    ## ldNeEst$rawNb = 1/(3*(ldNeEst[,4]-ldNeEst[,5]))
+	    ## CVf = sd(fec)/mean(fec)
+	    ## AL = 3-1+1
+	    ## ldNeEst$Nbadj = ldNeEst$rawNb/(0.991-0.206*log10(AL)+0.256*log10(3)+0.137*CVf)
+	    ## ldNeEst$Neadj = ldNeEst$Nbadj/(0.833+0.637*log10(AL)-0.793*log10(3)-0.423*CVf)
+
+
+
+	  condvar <- function(dprob,fec,theta){
+	    firstsum = 0.0
+	    varsy = fec+fec^2/theta
+	    for(i in 1:3){
+	      firstsum = firstsum + dprob[i]*sum(varsy[1:i])
+	    }
+	    secsum = 0.0
+	    for(i in 1:3){
+	      secsum = secsum + (sum(fec[1:i]))^2*(1-dprob[i])*dprob[i]
+	    }
+	    lastsum = 0.0
+	    for(i in 2:3){
+	      for(j in 1:(i-1)){
+		lastsum = lastsum + sum(fec[1:i])*dprob[i]*sum(fec[1:j])*dprob[j]
+	      }
+	    }
+	    tot = firstsum+secsum-2*lastsum
+	    tot
+	  }
+
+	  popPar = indiv$popPars  
+
+	  dprob = c(1-popPar$surv1,popPar$surv1*(1-popPar$surv2),popPar$surv2*popPar$surv1)
+	  fec = c(popPar$fec1,popPar$fec2,popPar$fec3)
+	  surv = c(popPar$surv1,popPar$surv2)
+	  les = make_les(fec,surv)
+
+	    doub_fec = 2*fec
+	    thet = popPar$theta
+	    varsy = doub_fec+doub_fec^2/thet
+
+
+	    growth_rate = max(Re(eigen(les,only.values = TRUE)$values))
+	    surv2 = cumprod(c(1,surv,0))
+	    surv3 = c(surv,0)
+	    fec2 = c(fec,0)
+
+	    repro_value <- function(a){
+	      lx = surv2[a]
+	      vx = 0.0
+	      for(i in a:4){
+		vx = vx+growth_rate^(-i-a+1)*surv2[i]/lx*fec2[i]
+	      }
+	      vx
+	    }
+
+	    rvs = c(repro_value(1),repro_value(2),repro_value(3))
+	    denom = 0.0
+	    for(i in 1:3){
+	      out = surv2[i]*growth_rate^(-i-1)
+	      iner = varsy[i]+surv3[i]*(1-surv3[i])*rvs[i]^2
+	      denom = denom + out*iner
+	      }
+
+
+  gen_length2 <- function(fec,surv,lambda){
+      ells = cumprod(c(1,surv))
+      nn = length(fec)
+      T = 0.0
+      for(i in 1:nn){
+	  T = T + i*lambda^(-i)*ells[i]*fec[i]
+      }
+      T
+  }
+
+	    gl2 = gen_length2(fec,surv,popPar$growth_rate)
+	    crowNe <- function(N,kbar,Vk,L){
+	      nume = (2*N-1)*kbar
+	      denom = 2*(1+Vk/kbar)
+	      nume*L/denom
+	    }
+
+	    tN = tN[41:51,]
+  NeEstSim = (4*tN[,1]*(gl2))/(estvar+estmean)
+  cNe = crowNe(tN[,1],estmean,estvar,gl2)
+  cNeNOL = crowNe(tN[,1],estmean,estvar,1)
+	  realVk = condvar(dprob,fec*2,popPar$theta)
+	  realKbar = sum(cumsum(2*fec)*dprob)
+
+	      library(tidyverse)
+
+
+
+	    NestSC = data.frame(log_N=ssdrSC[rownames(ssdrSC) == "log_N",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_N",2])
+	  NestSC$Llower = NestSC$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestSC$stdErr
+	  NestSC$Lupper = NestSC$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestSC$stdErr
+	  NestSC$lower = exp(NestSC$Llower)
+	  NestSC$upper = exp(NestSC$Lupper)
+	  NestSC$NestSC = exp(NestSC$log_N)
+	  NestSC$Ntrue = as.vector(t(tN))
+	  NestSC$age = rep(c(1,2,3),11)
+
+	  MestSC = data.frame(log_M=ssdrSC[rownames(ssdrSC) == "log_M",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_M",2])
+	  MestSC$Llower = MestSC$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestSC$stdErr
+	  MestSC$Lupper = MestSC$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestSC$stdErr
+	  MestSC$lower = exp(MestSC$Llower)
+	  MestSC$upper = exp(MestSC$Lupper)
+	  MestSC$MestSC = exp(MestSC$log_M)
+	  MestSC$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestSC$age = c(1,2)
+
+	  FecEstSC = data.frame(log_fec=ssdrSC[rownames(ssdrSC) == "log_fecundity",1],stdErr =ssdrSC[rownames(ssdrSC) == "log_fecundity",2])
+	  FecEstSC$Llower = FecEstSC$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstSC$stdErr
+	  FecEstSC$Lupper = FecEstSC$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstSC$stdErr
+	  FecEstSC$lower = exp(FecEstSC$Llower)
+	  FecEstSC$upper = exp(FecEstSC$Lupper)
+	  FecEstSC$FecEstSC = exp(FecEstSC$log_fec)
+	  FecEstSC$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  growth_rateEstSC = data.frame(estSCgrowth_rate = ssdrSC[rownames(ssdrSC) == "growth_rate",1],stdErr = ssdrSC[rownames(ssdrSC) == "growth_rate",2])
+	  growth_rateEstSC$lower = growth_rateEstSC$estSCgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstSC$stdErr
+	  growth_rateEstSC$upper = growth_rateEstSC$estSCgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstSC$stdErr
+	  growth_rateEstSC$trueGR = popPar$growth_rate
+
+
+	  NestMB = data.frame(log_N=ssdrMB[rownames(ssdrMB) == "log_N",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_N",2])
+	  NestMB$Llower = NestMB$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestMB$stdErr
+	  NestMB$Lupper = NestMB$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestMB$stdErr
+	  NestMB$lower = exp(NestMB$Llower)
+	  NestMB$upper = exp(NestMB$Lupper)
+	  NestMB$NestMB = exp(NestMB$log_N)
+	  NestMB$Ntrue = as.vector(t(tN))
+	  NestMB$age = rep(c(1,2,3),11)
+
+	  MestMB = data.frame(log_M=ssdrMB[rownames(ssdrMB) == "log_M",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_M",2])
+	  MestMB$Llower = MestMB$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestMB$stdErr
+	  MestMB$Lupper = MestMB$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestMB$stdErr
+	  MestMB$lower = exp(MestMB$Llower)
+	  MestMB$upper = exp(MestMB$Lupper)
+	  MestMB$MestMB = exp(MestMB$log_M)
+	  MestMB$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestMB$age = c(1,2)
+
+	  FecEstMB = data.frame(log_fec=ssdrMB[rownames(ssdrMB) == "log_fecundity",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_fecundity",2])
+	  FecEstMB$Llower = FecEstMB$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstMB$stdErr
+	  FecEstMB$Lupper = FecEstMB$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstMB$stdErr
+	  FecEstMB$lower = exp(FecEstMB$Llower)
+	  FecEstMB$upper = exp(FecEstMB$Lupper)
+	  FecEstMB$FecEstMB = exp(FecEstMB$log_fec)
+	  FecEstMB$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  thetaEstMB = data.frame(log_theta=ssdrMB[rownames(ssdrMB) == "log_theta",1],stdErr =ssdrMB[rownames(ssdrMB) == "log_theta",2])
+	  thetaEstMB$Llower = thetaEstMB$log_theta - qnorm(0.05/2,lower.tail = FALSE)*thetaEstMB$stdErr
+	  thetaEstMB$Lupper = thetaEstMB$log_theta + qnorm(0.05/2,lower.tail = FALSE)*thetaEstMB$stdErr
+	  thetaEstMB$lower = exp(thetaEstMB$Llower)
+	  thetaEstMB$upper = exp(thetaEstMB$Lupper)
+	  thetaEstMB$thetaEstMB = exp(thetaEstMB$log_theta)
+	  thetaEstMB$thetaTrue = c(popPar$theta)
+
+	  VkEstMB = data.frame(estVk = ssdrMB[rownames(ssdrMB) == "Vk",1],stdErr = ssdrMB[rownames(ssdrMB) == "Vk",2])
+	  VkEstMB$lower = VkEstMB$estVk - qnorm(0.05/2,lower.tail = FALSE)*VkEstMB$stdErr
+	  VkEstMB$upper = VkEstMB$estVk + qnorm(0.05/2,lower.tail = FALSE)*VkEstMB$stdErr
+	  VkEstMB$fromSim = estvar
+	  VkEstMB$fromSimPar = realVk
+
+	  growth_rateEstMB = data.frame(estgrowth_rate = ssdrMB[rownames(ssdrMB) == "growth_rate",1],stdErr = ssdrMB[rownames(ssdrMB) == "growth_rate",2])
+	  growth_rateEstMB$lower = growth_rateEstMB$estgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMB$stdErr
+	  growth_rateEstMB$upper = growth_rateEstMB$estgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMB$stdErr
+	  growth_rateEstMB$trueGR = popPar$growth_rate
+
+	  N_eEstMB = data.frame(estN_e = ssdrMB[rownames(ssdrMB) == "N_e",1],stdErr = ssdrMB[rownames(ssdrMB) == "N_e",2])
+	  N_eEstMB$lower = N_eEstMB$estN_e - qnorm(0.05/2,lower.tail = FALSE)*N_eEstMB$stdErr
+	  N_eEstMB$upper = N_eEstMB$estN_e + qnorm(0.05/2,lower.tail = FALSE)*N_eEstMB$stdErr
+	    N_eEstMB$fromSim = cNe
+	    #N_eEstMB$LDNE = ldNeEst$Neadj
+
+
+	    ##Sensitivity Analysis Additions
+	    ##For 2
+		  NestMVP2 = data.frame(log_N=ssdrMVP2[rownames(ssdrMVP2) == "log_N",1],stdErr =ssdrMVP2[rownames(ssdrMVP2) == "log_N",2])
+	  NestMVP2$Llower = NestMVP2$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestMVP2$stdErr
+	  NestMVP2$Lupper = NestMVP2$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestMVP2$stdErr
+	  NestMVP2$lower = exp(NestMVP2$Llower)
+	  NestMVP2$upper = exp(NestMVP2$Lupper)
+	  NestMVP2$NestMVP2 = exp(NestMVP2$log_N)
+	  NestMVP2$Ntrue = as.vector(t(tN))
+	  NestMVP2$age = rep(c(1,2,3),11)
+
+	  MestMVP2 = data.frame(log_M=ssdrMVP2[rownames(ssdrMVP2) == "log_M",1],stdErr =ssdrMVP2[rownames(ssdrMVP2) == "log_M",2])
+	  MestMVP2$Llower = MestMVP2$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestMVP2$stdErr
+	  MestMVP2$Lupper = MestMVP2$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestMVP2$stdErr
+	  MestMVP2$lower = exp(MestMVP2$Llower)
+	  MestMVP2$upper = exp(MestMVP2$Lupper)
+	  MestMVP2$MestMVP2 = exp(MestMVP2$log_M)
+	  MestMVP2$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestMVP2$age = c(1,2)
+
+	  FecEstMVP2 = data.frame(log_fec=ssdrMVP2[rownames(ssdrMVP2) == "log_fecundity",1],stdErr =ssdrMVP2[rownames(ssdrMVP2) == "log_fecundity",2])
+	  FecEstMVP2$Llower = FecEstMVP2$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstMVP2$stdErr
+	  FecEstMVP2$Lupper = FecEstMVP2$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstMVP2$stdErr
+	  FecEstMVP2$lower = exp(FecEstMVP2$Llower)
+	  FecEstMVP2$upper = exp(FecEstMVP2$Lupper)
+	  FecEstMVP2$FecEstMVP2 = exp(FecEstMVP2$log_fec)
+	  FecEstMVP2$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  thetaEstMVP2 = data.frame(log_theta=ssdrMVP2[rownames(ssdrMVP2) == "log_theta",1],stdErr =ssdrMVP2[rownames(ssdrMVP2) == "log_theta",2])
+	  thetaEstMVP2$Llower = thetaEstMVP2$log_theta - qnorm(0.05/2,lower.tail = FALSE)*thetaEstMVP2$stdErr
+	  thetaEstMVP2$Lupper = thetaEstMVP2$log_theta + qnorm(0.05/2,lower.tail = FALSE)*thetaEstMVP2$stdErr
+	  thetaEstMVP2$lower = exp(thetaEstMVP2$Llower)
+	  thetaEstMVP2$upper = exp(thetaEstMVP2$Lupper)
+	  thetaEstMVP2$thetaEstMVP2 = exp(thetaEstMVP2$log_theta)
+	  thetaEstMVP2$thetaTrue = c(popPar$theta)
+
+	  VkEstMVP2 = data.frame(estVk = ssdrMVP2[rownames(ssdrMVP2) == "Vk",1],stdErr = ssdrMVP2[rownames(ssdrMVP2) == "Vk",2])
+	  VkEstMVP2$lower = VkEstMVP2$estVk - qnorm(0.05/2,lower.tail = FALSE)*VkEstMVP2$stdErr
+	  VkEstMVP2$upper = VkEstMVP2$estVk + qnorm(0.05/2,lower.tail = FALSE)*VkEstMVP2$stdErr
+	  VkEstMVP2$fromSim = estvar
+	  VkEstMVP2$fromSimPar = realVk
+
+	  growth_rateEstMVP2 = data.frame(estgrowth_rate = ssdrMVP2[rownames(ssdrMVP2) == "growth_rate",1],stdErr = ssdrMVP2[rownames(ssdrMVP2) == "growth_rate",2])
+	  growth_rateEstMVP2$lower = growth_rateEstMVP2$estgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMVP2$stdErr
+	  growth_rateEstMVP2$upper = growth_rateEstMVP2$estgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMVP2$stdErr
+	  growth_rateEstMVP2$trueGR = popPar$growth_rate
+
+	  N_eEstMVP2 = data.frame(estN_e = ssdrMVP2[rownames(ssdrMVP2) == "N_e",1],stdErr = ssdrMVP2[rownames(ssdrMVP2) == "N_e",2])
+	  N_eEstMVP2$lower = N_eEstMVP2$estN_e - qnorm(0.05/2,lower.tail = FALSE)*N_eEstMVP2$stdErr
+	  N_eEstMVP2$upper = N_eEstMVP2$estN_e + qnorm(0.05/2,lower.tail = FALSE)*N_eEstMVP2$stdErr
+	    N_eEstMVP2$fromSim = cNe
+
+	    ##For 1
+		  NestMVP1 = data.frame(log_N=ssdrMVP1[rownames(ssdrMVP1) == "log_N",1],stdErr =ssdrMVP1[rownames(ssdrMVP1) == "log_N",2])
+	  NestMVP1$Llower = NestMVP1$log_N - qnorm(0.05/2,lower.tail = FALSE)*NestMVP1$stdErr
+	  NestMVP1$Lupper = NestMVP1$log_N + qnorm(0.05/2,lower.tail = FALSE)*NestMVP1$stdErr
+	  NestMVP1$lower = exp(NestMVP1$Llower)
+	  NestMVP1$upper = exp(NestMVP1$Lupper)
+	  NestMVP1$NestMVP1 = exp(NestMVP1$log_N)
+	  NestMVP1$Ntrue = as.vector(t(tN))
+	  NestMVP1$age = rep(c(1,2,3),11)
+
+	  MestMVP1 = data.frame(log_M=ssdrMVP1[rownames(ssdrMVP1) == "log_M",1],stdErr =ssdrMVP1[rownames(ssdrMVP1) == "log_M",2])
+	  MestMVP1$Llower = MestMVP1$log_M - qnorm(0.05/2,lower.tail = FALSE)*MestMVP1$stdErr
+	  MestMVP1$Lupper = MestMVP1$log_M + qnorm(0.05/2,lower.tail = FALSE)*MestMVP1$stdErr
+	  MestMVP1$lower = exp(MestMVP1$Llower)
+	  MestMVP1$upper = exp(MestMVP1$Lupper)
+	  MestMVP1$MestMVP1 = exp(MestMVP1$log_M)
+	  MestMVP1$Mtrue = -log(c(popPar$surv1,popPar$surv2))
+	  MestMVP1$age = c(1,2)
+
+	  FecEstMVP1 = data.frame(log_fec=ssdrMVP1[rownames(ssdrMVP1) == "log_fecundity",1],stdErr =ssdrMVP1[rownames(ssdrMVP1) == "log_fecundity",2])
+	  FecEstMVP1$Llower = FecEstMVP1$log_fec - qnorm(0.05/2,lower.tail = FALSE)*FecEstMVP1$stdErr
+	  FecEstMVP1$Lupper = FecEstMVP1$log_fec + qnorm(0.05/2,lower.tail = FALSE)*FecEstMVP1$stdErr
+	  FecEstMVP1$lower = exp(FecEstMVP1$Llower)
+	  FecEstMVP1$upper = exp(FecEstMVP1$Lupper)
+	  FecEstMVP1$FecEstMVP1 = exp(FecEstMVP1$log_fec)
+	  FecEstMVP1$FecTrue = c(popPar$fec1,popPar$fec2,popPar$fec3)
+
+	  thetaEstMVP1 = data.frame(log_theta=ssdrMVP1[rownames(ssdrMVP1) == "log_theta",1],stdErr =ssdrMVP1[rownames(ssdrMVP1) == "log_theta",2])
+	  thetaEstMVP1$Llower = thetaEstMVP1$log_theta - qnorm(0.05/2,lower.tail = FALSE)*thetaEstMVP1$stdErr
+	  thetaEstMVP1$Lupper = thetaEstMVP1$log_theta + qnorm(0.05/2,lower.tail = FALSE)*thetaEstMVP1$stdErr
+	  thetaEstMVP1$lower = exp(thetaEstMVP1$Llower)
+	  thetaEstMVP1$upper = exp(thetaEstMVP1$Lupper)
+	  thetaEstMVP1$thetaEstMVP1 = exp(thetaEstMVP1$log_theta)
+	  thetaEstMVP1$thetaTrue = c(popPar$theta)
+
+	  VkEstMVP1 = data.frame(estVk = ssdrMVP1[rownames(ssdrMVP1) == "Vk",1],stdErr = ssdrMVP1[rownames(ssdrMVP1) == "Vk",2])
+	  VkEstMVP1$lower = VkEstMVP1$estVk - qnorm(0.05/2,lower.tail = FALSE)*VkEstMVP1$stdErr
+	  VkEstMVP1$upper = VkEstMVP1$estVk + qnorm(0.05/2,lower.tail = FALSE)*VkEstMVP1$stdErr
+	  VkEstMVP1$fromSim = estvar
+	  VkEstMVP1$fromSimPar = realVk
+
+	  growth_rateEstMVP1 = data.frame(estgrowth_rate = ssdrMVP1[rownames(ssdrMVP1) == "growth_rate",1],stdErr = ssdrMVP1[rownames(ssdrMVP1) == "growth_rate",2])
+	  growth_rateEstMVP1$lower = growth_rateEstMVP1$estgrowth_rate - qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMVP1$stdErr
+	  growth_rateEstMVP1$upper = growth_rateEstMVP1$estgrowth_rate + qnorm(0.05/2,lower.tail = FALSE)*growth_rateEstMVP1$stdErr
+	  growth_rateEstMVP1$trueGR = popPar$growth_rate
+
+	  N_eEstMVP1 = data.frame(estN_e = ssdrMVP1[rownames(ssdrMVP1) == "N_e",1],stdErr = ssdrMVP1[rownames(ssdrMVP1) == "N_e",2])
+	  N_eEstMVP1$lower = N_eEstMVP1$estN_e - qnorm(0.05/2,lower.tail = FALSE)*N_eEstMVP1$stdErr
+	  N_eEstMVP1$upper = N_eEstMVP1$estN_e + qnorm(0.05/2,lower.tail = FALSE)*N_eEstMVP1$stdErr
+	    N_eEstMVP1$fromSim = cNe
+
+
+
+	  ret = list(optSC=optSC,convergedSC=optSC$convergence,reportSC=reportSC,NestSC=NestSC,MestSC=MestSC,FecEstSC=FecEstSC,
+		     growth_rateEstSC=growth_rateEstSC,
+		     optMB=optMB,convergedMB=optMB$convergence,reportMB=reportMB,NestMB=NestMB,MestMB=MestMB,FecEstMB=FecEstMB,thetaEstMB=thetaEstMB,VkEstMB=VkEstMB,
+		     growth_rateEstMB=growth_rateEstMB,N_eEstMB=N_eEstMB,
+		      optMVP2=optMVP2,convergedMVP2=optMVP2$convergence,reportMVP2=reportMVP2,NestMVP2=NestMVP2,MestMVP2=MestMVP2,FecEstMVP2=FecEstMVP2,thetaEstMVP2=thetaEstMVP2,VkEstMVP2=VkEstMVP2,
+		     growth_rateEstMVP2=growth_rateEstMVP2,N_eEstMVP2=N_eEstMVP2,
+		      optMVP1=optMVP1,convergedMVP1=optMVP1$convergence,reportMVP1=reportMVP1,NestMVP1=NestMVP1,MestMVP1=MestMVP1,FecEstMVP1=FecEstMVP1,thetaEstMVP1=thetaEstMVP1,VkEstMVP1=VkEstMVP1,
+		     growth_rateEstMVP1=growth_rateEstMVP1,N_eEstMVP1=N_eEstMVP1)
+
+
+	    fitteddir = paste0(rep_df[[k]]$foldname[1],"/fitted/")
+	    if(!dir.exists(fitteddir)){
+	      dir.create(fitteddir)
+	    }
+
+	    saveRDS(ret,file=paste0(fitteddir,"fittedR",str_pad(rr,4,pad="0"),".rds"))
+	  }
+	}
+
+#+end_src
