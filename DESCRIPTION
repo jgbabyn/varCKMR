@@ -2,7 +2,7 @@ Package: varCKMR
 Title: varCKMR
 Version: 0.97
 Authors@R: 
-    person("Jonathan", "Babyn", , "jonathan.babyn@dal.ca", role = c("aut", "cre"),
+    person("XXXX", "XXXX", , "XXXX@XXXX.com", role = c("aut", "cre"),
            comment = c(ORCID = "YOUR-ORCID-ID"))
 Description: Demonstration of estimating the variance in number of offspring and effective population size using CKMR. 
 License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a

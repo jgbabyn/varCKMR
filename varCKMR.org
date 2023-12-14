@@ -1,8 +1,9 @@
 #+Title: varCKMR
-#+author: Jonathan Babyn
+#+author: 
 #+LATEX_HEADER: \usepackage{bm}
 #+LATEX_HEADER: \usepackage[margin=1in]{geometry}
 #+LATEX_HEADER: \usepackage{amsmath}
+
 
 * Introduction
   
