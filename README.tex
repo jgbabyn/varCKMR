@@ -1,0 +1,115 @@
+% Created 2023-12-14 Thu 09:59
+% Intended LaTeX compiler: pdflatex
+\documentclass[11pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{graphicx}
+\usepackage{grffile}
+\usepackage{longtable}
+\usepackage{wrapfig}
+\usepackage{rotating}
+\usepackage[normalem]{ulem}
+\usepackage{amsmath}
+\usepackage{textcomp}
+\usepackage{amssymb}
+\usepackage{capt-of}
+\usepackage{hyperref}
+\usepackage{bm}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\author{Jonathan Babyn}
+\date{\today}
+\title{}
+\hypersetup{
+ pdfauthor={Jonathan Babyn},
+ pdftitle={},
+ pdfkeywords={},
+ pdfsubject={},
+ pdfcreator={Emacs 27.1 (Org mode 9.3)}, 
+ pdflang={English}}
+\begin{document}
+
+
+
+\section{Introduction}
+\label{sec:org4b7a35b}
+
+  \texttt{varCKMR} is a pseudo R package to showcase a method of estimating the variance in
+the distribution of number of offspring. It does this using within birth-cohort 
+sibling comparisons. 
+
+It contains an individual based simulation that installs as the \texttt{R} package \texttt{varCKMR} along with 
+some helper functions.
+The \texttt{TMB} models used in the analysis are in the \texttt{models} folder with the \texttt{ssmodelAdj.cpp}
+being the model using within-cohort sibling comparisons and the \texttt{ssmodelNoSC.cpp} model 
+omitting them.
+
+The \texttt{scripts} folder contains the scripts to recreate the simulations used in the analysis. \texttt{populations}
+is where the \texttt{populations} used in the analysis would be kept althought they are ommitted here for space reasons. 
+\texttt{sims} contains all the samples from each population but are again ommitted for space reasons. 
+
+The org file \texttt{varCKMR.org} contains all the files to make all the files in this folder.
+
+\section{A note on \(\sigma^2_{tot}\)}
+\label{sec:org8beaf97}
+
+The code here uses a more complicated derivation  to break up \(\sigma^2_{tot}\) (and \(Var(R)\)) then what is given in the
+paper:
+
+\begin{multline}
+\label{muteqlaw2}
+\sigma^2_{tot} = Var(X) = \sum_{a=0}^A Var(X|D = a)\Delta_a + \sum_{a=0}^A E[X| D = a]^2(1-\Delta_a)\Delta_a- \\ 
+ 2\sum_{a=1}^A\sum_{b=0}^{a-1} E[X|D = a] \Delta_a E[X|D = b] \Delta_b.
+\end{multline}
+
+This form assumes that X is also mutually exclusive (which age of death and age of parent are) but if that is the case then the form above and the form
+given in the paper will agree.
+
+\begin{verbatim}
+##See README
+##here is a small example using the sim parameters from one of the populations
+
+surv = c(0.215,0.280)
+death_probs = c(1-surv[1],surv[1]*(1-surv[2]),surv[1]*surv[2])
+fecundity = 2*c(0.380,1.518,3.416)
+theta = 0.1
+
+EXD = cumsum(fecundity)
+V1 = fecundity+fecundity^2/theta
+varXD = cumsum(V1)
+
+
+oldform <- function(varXD,EXD,Delta){
+  firstsum <- sum(varXD*Delta)
+  secondsum <- sum(EXD^2*(1-Delta)*(Delta))
+
+  thirdsum <- 0
+  for(i in 2:length(EXD)){
+    for(j in 1:(i-1)){
+      thirdsum = thirdsum + EXD[i]*Delta[i]*EXD[j]*Delta[j]
+    }
+  }
+
+  total <- firstsum + secondsum -2*thirdsum
+  total
+
+
+}
+
+newform <- function(varXD,EXD,Delta){
+  mu_tot = sum(EXD*Delta)
+  firstsum = sum(varXD*Delta)
+  secondsum = sum(EXD^2*Delta)
+  total = firstsum+secondsum-mu_tot^2
+  total
+}
+
+oldv = oldform(varXD,EXD,death_probs)
+newv = newform(varXD,EXD,death_probs)
+print(paste0("old: ",round(oldv,3)," new: ", round(newv,3)))
+\end{verbatim}
+
+\begin{verbatim}
+old: 61.673 new: 61.673
+\end{verbatim}
+\end{document}
